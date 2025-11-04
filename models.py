@@ -7,6 +7,8 @@ import seaborn as sns
 import os
 from datetime import datetime
 import logging
+from sklearn.manifold import TSNE
+from scipy.fft import fft
 
 # Set style for defense-focused visualizations
 plt.style.use('seaborn-v0_8-darkgrid')
@@ -118,9 +120,59 @@ class DenoisingAutoencoder(nn.Module):
                     dpi=300, bbox_inches='tight')
         plt.close()
 
+        # Advanced visualization: Reconstruction error per frequency band
+        if epoch % 10 == 0:  # Generate advanced plots every 10 epochs
+            self.visualize_frequency_analysis(orig_np, recon_np, epoch)
+
         # Log reconstruction quality
         reconstruction_error = np.mean((orig_np - recon_np)**2, axis=1)
         self.logger.info(f'Epoch {epoch}, Batch {batch_idx} - Mean Reconstruction Error: {np.mean(reconstruction_error):.6f}')
+
+    def visualize_frequency_analysis(self, original, reconstructed, epoch):
+        """Advanced sonar visualization: Frequency domain analysis for anomaly detection."""
+        os.makedirs('results/visualizations/sonar', exist_ok=True)
+
+        # Compute FFT for frequency analysis
+        fft_orig = np.abs(fft(original, axis=1))
+        fft_recon = np.abs(fft(reconstructed, axis=1))
+
+        # Define frequency bands (sonar features are in specific ranges)
+        n_freqs = original.shape[1]
+        freq_bands = np.linspace(0, n_freqs//2, 10)  # 10 frequency bands
+
+        # Reconstruction error per frequency band
+        band_errors = []
+        band_labels = []
+
+        for i in range(len(freq_bands)-1):
+            start_idx = int(freq_bands[i])
+            end_idx = int(freq_bands[i+1])
+
+            orig_band = fft_orig[:, start_idx:end_idx]
+            recon_band = fft_recon[:, start_idx:end_idx]
+            error = np.mean((orig_band - recon_band)**2, axis=(0, 1))
+            band_errors.append(error)
+            band_labels.append(f'{start_idx}-{end_idx}')
+
+        # Bar plot of reconstruction error per frequency band
+        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+        bars = ax.bar(band_labels, band_errors, color='steelblue', alpha=0.8, edgecolor='black')
+        ax.set_xlabel('Frequency Band (FFT Bins)')
+        ax.set_ylabel('Mean Squared Reconstruction Error')
+        ax.set_title(f'Sonar Reconstruction Error by Frequency Band - Epoch {epoch}')
+        ax.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+
+        # Add value labels on bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + 0.001,
+                    f'{height:.4f}', ha='center', va='bottom', fontsize=8)
+
+        plt.tight_layout()
+        plt.savefig(f'results/visualizations/sonar/dae_frequency_error_epoch_{epoch}.png',
+                    dpi=300, bbox_inches='tight')
+        plt.close()
 
     def log_training_step(self, epoch, loss, lr):
         """Log training progress for research and defense monitoring."""
@@ -146,6 +198,7 @@ class VariationalAutoencoder(nn.Module):
         self.conv_filters = conv_filters
 
         # Encoder: Conv1D layers for temporal feature extraction
+        # Input shape: (batch, channels, window_size)
         self.encoder_conv = nn.Sequential(
             nn.Conv1d(n_channels, conv_filters[0], kernel_size=5, stride=2, padding=2),
             nn.ReLU(),
@@ -239,12 +292,17 @@ class VariationalAutoencoder(nn.Module):
         # Convert to numpy
         mu_np = mu.detach().cpu().numpy()
         logvar_np = logvar.detach().cpu().numpy()
+        labels_np = labels.detach().cpu().numpy()
+
+        # Advanced latent space visualization with t-SNE
+        if mu_np.shape[0] > 50:  # Only if we have enough samples
+            self.visualize_latent_tsne(mu_np, labels_np, epoch)
 
         # Latent space scatter plot (first 2 dimensions)
         fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
         # Color by anomaly labels
-        colors = ['blue' if label == 0 else 'red' for label in labels]
+        colors = ['blue' if label == 0 else 'red' for label in labels_np]
 
         # Mu scatter
         axes[0].scatter(mu_np[:, 0], mu_np[:, 1], c=colors, alpha=0.7, s=50, edgecolors='black')
@@ -252,6 +310,10 @@ class VariationalAutoencoder(nn.Module):
         axes[0].set_ylabel('Latent Dimension 2 (μ)')
         axes[0].set_title('Latent Space Distribution (Mean Vectors)')
         axes[0].grid(True, alpha=0.3)
+        # Add legend
+        axes[0].scatter([], [], c='blue', label='Normal Operation', alpha=0.7, s=50, edgecolors='black')
+        axes[0].scatter([], [], c='red', label='Anomalous Degradation', alpha=0.7, s=50, edgecolors='black')
+        axes[0].legend()
 
         # Log-variance distribution
         axes[1].hist(logvar_np.flatten(), bins=50, alpha=0.7, color='purple', edgecolor='black')
@@ -268,6 +330,34 @@ class VariationalAutoencoder(nn.Module):
         # Log latent space statistics
         self.logger.info(f'Epoch {epoch} - Latent μ mean: {np.mean(mu_np):.4f}, std: {np.std(mu_np):.4f}')
         self.logger.info(f'Epoch {epoch} - Latent logvar mean: {np.mean(logvar_np):.4f}, std: {np.std(logvar_np):.4f}')
+
+    def visualize_latent_tsne(self, mu, labels, epoch):
+        """t-SNE visualization for better latent space separation analysis."""
+        os.makedirs('results/visualizations/ims', exist_ok=True)
+
+        # Apply t-SNE to latent space
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(mu)-1))
+        latent_tsne = tsne.fit_transform(mu)
+
+        # Plot t-SNE projection
+        fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+        colors = ['blue' if label == 0 else 'red' for label in labels]
+
+        scatter = ax.scatter(latent_tsne[:, 0], latent_tsne[:, 1], c=colors, alpha=0.7, s=60, edgecolors='black')
+        ax.set_xlabel('t-SNE Dimension 1')
+        ax.set_ylabel('t-SNE Dimension 2')
+        ax.set_title(f'VAE Latent Space t-SNE Projection - Epoch {epoch}')
+        ax.grid(True, alpha=0.3)
+
+        # Add legend
+        ax.scatter([], [], c='blue', label='Normal Operation', alpha=0.7, s=60, edgecolors='black')
+        ax.scatter([], [], c='red', label='Anomalous Degradation', alpha=0.7, s=60, edgecolors='black')
+        ax.legend()
+
+        plt.tight_layout()
+        plt.savefig(f'results/visualizations/ims/vae_latent_tsne_epoch_{epoch}.png',
+                    dpi=300, bbox_inches='tight')
+        plt.close()
 
     def visualize_reconstruction(self, original, reconstructed, epoch, batch_idx):
         """Generate research visualizations for signal reconstruction."""
@@ -302,9 +392,46 @@ class VariationalAutoencoder(nn.Module):
                     dpi=300, bbox_inches='tight')
         plt.close()
 
+        # Advanced visualization: Time-domain reconstruction error analysis
+        if batch_idx % 50 == 0:  # Generate advanced plots periodically
+            self.visualize_reconstruction_error(orig_np, recon_np, epoch, batch_idx)
+
         # Log reconstruction quality
         reconstruction_error = np.mean((orig_np - recon_np)**2)
         self.logger.info(f'Epoch {epoch}, Batch {batch_idx} - Reconstruction MSE: {reconstruction_error:.6f}')
+
+    def visualize_reconstruction_error(self, original, reconstructed, epoch, batch_idx):
+        """Advanced seismic visualization: Time-domain reconstruction error analysis."""
+        os.makedirs('results/visualizations/ims', exist_ok=True)
+
+        # Compute reconstruction error across time
+        error = (original - reconstructed) ** 2  # MSE per sample
+
+        # Aggregate error across channels and batch
+        time_error = np.mean(error, axis=(0, 1))  # Mean error per time step
+
+        # Plot time-domain reconstruction error
+        fig, ax = plt.subplots(1, 1, figsize=(14, 6))
+        ax.plot(time_error, 'r-', linewidth=2, label='Reconstruction MSE')
+        ax.fill_between(range(len(time_error)), time_error, alpha=0.3, color='red')
+        ax.set_xlabel('Time Sample Index')
+        ax.set_ylabel('Mean Squared Reconstruction Error')
+        ax.set_title(f'VAE Time-Domain Reconstruction Error - Epoch {epoch}, Batch {batch_idx}')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        # Highlight potential anomaly regions (high error spikes)
+        threshold = np.mean(time_error) + 2 * np.std(time_error)
+        anomaly_indices = time_error > threshold
+        if np.any(anomaly_indices):
+            ax.scatter(np.where(anomaly_indices)[0], time_error[anomaly_indices],
+                      c='darkred', s=50, marker='x', label='Potential Anomalies', zorder=5)
+            ax.legend()
+
+        plt.tight_layout()
+        plt.savefig(f'results/visualizations/ims/vae_error_analysis_epoch_{epoch}_batch_{batch_idx}.png',
+                    dpi=300, bbox_inches='tight')
+        plt.close()
 
     def log_training_step(self, epoch, total_loss, mse_loss, kl_loss, lr):
         """Log training progress for research and defense monitoring."""
@@ -322,11 +449,12 @@ def create_dae_sonar(input_dim=60):
     print(f"Created DAE for Sonar: Input dim {input_dim}, Latent dim 8")
     return model
 
-def create_vae_ims(window_size=1024, n_channels=4, latent_dim=64):
+def create_vae_ims(window_size=1024, n_channels=8, latent_dim=64):
     """
     Factory function for IMS VAE model instantiation.
 
     Defense Context: Vibration anomaly detection for aerospace bearing monitoring
+    Note: n_channels=8 to match the actual IMS data (8 channels)
     """
     model = VariationalAutoencoder(
         window_size=window_size,

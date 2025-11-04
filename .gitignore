@@ -1,3 +1,7 @@
 Datasets
 venv
 **/*logs
+**/*visualizations
+*.pth
+**/__pycache__/
+checkpoints/
