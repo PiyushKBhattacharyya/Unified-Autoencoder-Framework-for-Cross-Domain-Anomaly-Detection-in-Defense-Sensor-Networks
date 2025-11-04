@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import random
+import pandas as pd
 
 # Import custom modules for defense sensor anomaly detection
 from data_loader import load_sonar_data, load_ims_data, set_random_seed
@@ -245,9 +246,7 @@ def train_dae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
 
         print(f"Epoch {epoch+1:3d}/{epochs} | Train Loss: {avg_train_loss:.6f} F1: {train_f1:.3f} AUC: {train_auc:.3f} | Val Loss: {avg_val_loss:.6f} F1: {val_f1:.3f} AUC: {val_auc:.3f} | LR: {current_lr:.6f}")
 
-        # Log additional defense metrics for operational monitoring
-        logger.info(f"Defense Metrics - Train Precision: {train_precision:.4f}, Recall: {train_recall:.4f}, Accuracy: {train_accuracy:.4f}")
-        logger.info(f"Defense Metrics - Val Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, Accuracy: {val_accuracy:.4f}")
+        # Logging handled at main level
 
         # Early stopping check
         if avg_val_loss < best_val_loss:
@@ -313,13 +312,27 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
     os.makedirs('checkpoints', exist_ok=True)
     checkpoint_path = 'checkpoints/vae_ims_best.pth'
 
-    # Training history for visualization
+    from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, accuracy_score
+
+    # Training history for visualization and comprehensive metrics tracking
     train_total_losses = []
     train_mse_losses = []
     train_kl_losses = []
     val_total_losses = []
     val_mse_losses = []
     val_kl_losses = []
+
+    # Store metrics for anomaly detection evaluation
+    train_aucs = []
+    val_aucs = []
+    train_f1s = []
+    val_f1s = []
+    train_precisions = []
+    val_precisions = []
+    train_recalls = []
+    val_recalls = []
+    train_accuracies = []
+    val_accuracies = []
 
     # Store latent space data for visualization (limited for memory efficiency)
     val_mu_list = []
@@ -337,15 +350,18 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
         stream = torch.cuda.current_stream(device)
 
     for epoch in range(epochs):
-        # Training phase with optimized batch processing
+        # Training phase with optimized batch processing and metrics calculation
         epoch_train_total = 0.0
         epoch_train_mse = 0.0
         epoch_train_kl = 0.0
+        train_errors = []
+        train_labels = []
 
         train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs} [Train]', leave=False)
 
-        for batch_idx, (inputs, labels) in enumerate(train_pbar):
+        for batch_idx, (inputs, labels_batch) in enumerate(train_pbar):
             inputs = inputs.to(device)
+            labels_batch = labels_batch.to(device)
 
             # Asynchronous forward pass for acceleration
             if device.type == 'cuda':
@@ -362,6 +378,12 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
             epoch_train_total += total_loss.item()
             epoch_train_mse += mse_loss.item()
             epoch_train_kl += kl_loss.item()
+
+            # Collect reconstruction errors and labels for metrics (per-sample MSE)
+            # Compute MSE per sample (mean over all dimensions for each sample in batch)
+            per_sample_errors = torch.mean((reconstructed - inputs) ** 2, dim=[1, 2]).detach().cpu().numpy()
+            train_errors.extend(per_sample_errors)
+            train_labels.extend(labels_batch.cpu().numpy())
 
             # Periodic visualization for research monitoring (reduced frequency for speed)
             if batch_idx % 100 == 0 and batch_idx > 0:
@@ -381,16 +403,43 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
         train_mse_losses.append(avg_train_mse)
         train_kl_losses.append(avg_train_kl)
 
-        # Validation phase with optimized batch processing
+        # Calculate training metrics
+        train_errors = np.array(train_errors)
+        train_labels = np.array(train_labels)
+
+        # Use 95th percentile as anomaly threshold for training metrics
+        train_threshold = np.percentile(train_errors, 95)
+        train_predictions = (train_errors > train_threshold).astype(int)
+
+        train_precision = precision_score(train_labels, train_predictions, zero_division=0)
+        train_recall = recall_score(train_labels, train_predictions, zero_division=0)
+        train_f1 = f1_score(train_labels, train_predictions, zero_division=0)
+        train_accuracy = accuracy_score(train_labels, train_predictions)
+
+        if len(np.unique(train_labels)) > 1:
+            train_auc = roc_auc_score(train_labels, train_errors)
+        else:
+            train_auc = np.nan
+
+        train_aucs.append(train_auc)
+        train_f1s.append(train_f1)
+        train_precisions.append(train_precision)
+        train_recalls.append(train_recall)
+        train_accuracies.append(train_accuracy)
+
+        # Validation phase with optimized batch processing and metrics
         model.eval()
         val_total = 0.0
         val_mse = 0.0
         val_kl = 0.0
+        val_errors = []
+        val_labels = []
 
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{epochs} [Val]', leave=False)
-            for inputs, labels in val_pbar:
+            for inputs, labels_batch in val_pbar:
                 inputs = inputs.to(device)
+                labels_batch = labels_batch.to(device)
 
                 if device.type == 'cuda':
                     with torch.cuda.stream(stream):
@@ -404,11 +453,16 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
                 val_mse += mse_loss.item()
                 val_kl += kl_loss.item()
 
+                # Collect errors and labels for validation metrics (per-sample MSE)
+                per_sample_val_errors = torch.mean((reconstructed - inputs) ** 2, dim=[1, 2]).detach().cpu().numpy()
+                val_errors.extend(per_sample_val_errors)
+                val_labels.extend(labels_batch.cpu().numpy())
+
                 # Collect latent space data for visualization (limit memory usage)
                 if len(val_mu_list) < 10:  # Limit to 10 batches for memory efficiency
                     val_mu_list.append(mu.cpu())
                     val_logvar_list.append(logvar.cpu())
-                    val_labels_list.append(labels.cpu())
+                    val_labels_list.append(labels_batch.cpu())
 
                 val_pbar.set_postfix({
                     'total': f'{total_loss.item():.6f}',
@@ -424,13 +478,36 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
         val_mse_losses.append(avg_val_mse)
         val_kl_losses.append(avg_val_kl)
 
+        # Calculate validation metrics
+        val_errors = np.array(val_errors)
+        val_labels = np.array(val_labels)
+
+        val_threshold = np.percentile(val_errors, 95)
+        val_predictions = (val_errors > val_threshold).astype(int)
+
+        val_precision = precision_score(val_labels, val_predictions, zero_division=0)
+        val_recall = recall_score(val_labels, val_predictions, zero_division=0)
+        val_f1 = f1_score(val_labels, val_predictions, zero_division=0)
+        val_accuracy = accuracy_score(val_labels, val_predictions)
+
+        if len(np.unique(val_labels)) > 1:
+            val_auc = roc_auc_score(val_labels, val_errors)
+        else:
+            val_auc = np.nan
+
+        val_aucs.append(val_auc)
+        val_f1s.append(val_f1)
+        val_precisions.append(val_precision)
+        val_recalls.append(val_recall)
+        val_accuracies.append(val_accuracy)
+
         scheduler.step(avg_val_total)
 
-        # Log training progress
+        # Log training progress with comprehensive metrics
         current_lr = optimizer.param_groups[0]['lr']
         model.log_training_step(epoch, avg_train_total, avg_train_mse, avg_train_kl, current_lr)
 
-        print(f"Epoch {epoch+1:3d}/{epochs} | Train Total: {avg_train_total:.6f} MSE: {avg_train_mse:.6f} KL: {avg_train_kl:.6f} | Val Total: {avg_val_total:.6f} MSE: {avg_val_mse:.6f} KL: {avg_val_kl:.6f} | LR: {current_lr:.6f}")
+        print(f"Epoch {epoch+1:3d}/{epochs} | Train Total: {avg_train_total:.6f} MSE: {avg_train_mse:.6f} KL: {avg_train_kl:.6f} F1: {train_f1:.3f} AUC: {train_auc:.3f} | Val Total: {avg_val_total:.6f} MSE: {avg_val_mse:.6f} KL: {avg_val_kl:.6f} F1: {val_f1:.3f} AUC: {val_auc:.3f} | LR: {current_lr:.6f}")
 
         # Early stopping check
         if avg_val_total < best_val_loss:
@@ -476,151 +553,207 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
         else:
             model.visualize_latent_space(mu_all, logvar_all, labels_all, epoch=len(train_total_losses)-1)
 
-    return model, train_total_losses, train_mse_losses, train_kl_losses, val_total_losses, val_mse_losses, val_kl_losses
+    # Defense Application: Comprehensive metrics tracking enables detailed performance analysis
+    # for operational anomaly detection deployment in defense sensor networks
+    return model, train_total_losses, train_mse_losses, train_kl_losses, val_total_losses, val_mse_losses, val_kl_losses, train_aucs, val_aucs, train_f1s, val_f1s, train_precisions, val_precisions, train_recalls, val_recalls, train_accuracies, val_accuracies
 
-def plot_training_curves(losses_dict, model_name, save_path, aucs=None, f1s=None):
+def plot_training_curves(losses_dict, model_name, save_path, aucs=None, f1s=None, metrics=None, precisions=None, recalls=None, accuracies=None):
     """
-    Generate comprehensive research-quality training curve visualizations including metrics.
+    Generate individual research-quality training curve visualizations for each metric.
 
-    Defense Context: Multi-metric visualization enables assessment of model performance
+    Defense Context: Individual metric visualization enables focused assessment of model performance
     across different evaluation criteria critical for defense sensor deployment decisions.
     """
     os.makedirs('results/visualizations', exist_ok=True)
 
     epochs = range(1, len(losses_dict[list(losses_dict.keys())[0]]) + 1)
 
+    # Set seaborn style for all plots
+    sns.set_palette("husl")
+
     if model_name == 'DAE':
-        plt.figure(figsize=(20, 12))
-
-        # Loss curves
-        plt.subplot(2, 3, 1)
-        plt.plot(epochs, losses_dict['train'], 'b-', linewidth=2, label='Training Loss', marker='o', markersize=3)
-        plt.plot(epochs, losses_dict['val'], 'r-', linewidth=2, label='Validation Loss', marker='s', markersize=3)
-        plt.xlabel('Epoch')
-        plt.ylabel('MSE Reconstruction Loss')
-        plt.title(f'{model_name} Loss Curves')
-        plt.legend()
+        # 1. Loss curves - individual diagram
+        plt.figure(figsize=(12, 8))
+        plt.plot(epochs, losses_dict['train'], 'b-', linewidth=2, label='Training Loss', marker='o', markersize=4)
+        plt.plot(epochs, losses_dict['val'], 'r-', linewidth=2, label='Validation Loss', marker='s', markersize=4)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('MSE Reconstruction Loss', fontsize=12)
+        plt.title(f'{model_name} Training and Validation Loss Curves', fontsize=14, fontweight='bold')
+        plt.legend(fontsize=11)
         plt.grid(True, alpha=0.3)
+        plt.xticks(fontsize=10)
+        plt.yticks(fontsize=10)
+        plt.tight_layout()
+        loss_path = save_path.replace('_training_curves.png', '_loss_curves.png')
+        plt.savefig(loss_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"📊 DAE loss curves saved to {loss_path}")
 
-        # AUC curves if available
-        if aucs and len(aucs[0]) > 0:
-            plt.subplot(2, 3, 2)
-            plt.plot(epochs, aucs[0], 'g-', linewidth=2, label='Train AUC', marker='o', markersize=3)
-            plt.plot(epochs, aucs[1], 'm-', linewidth=2, label='Val AUC', marker='s', markersize=3)
-            plt.xlabel('Epoch')
-            plt.ylabel('AUC Score')
-            plt.title(f'{model_name} AUC Curves')
-            plt.legend()
+        # 2. AUC curves if available
+        if aucs and len(aucs[0]) > 0 and len(aucs[1]) > 0:
+            plt.figure(figsize=(12, 8))
+            plt.plot(epochs, aucs[0], 'g-', linewidth=2, label='Training AUC', marker='o', markersize=4)
+            plt.plot(epochs, aucs[1], 'm-', linewidth=2, label='Validation AUC', marker='s', markersize=4)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('AUC Score', fontsize=12)
+            plt.title(f'{model_name} AUC Curves', fontsize=14, fontweight='bold')
+            plt.legend(fontsize=11)
             plt.grid(True, alpha=0.3)
             plt.ylim([0, 1])
+            plt.xticks(fontsize=10)
+            plt.yticks(fontsize=10)
+            plt.tight_layout()
+            auc_path = save_path.replace('_training_curves.png', '_auc_curves.png')
+            plt.savefig(auc_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"📊 DAE AUC curves saved to {auc_path}")
 
-        # F1 curves if available
-        if f1s and len(f1s[0]) > 0:
-            plt.subplot(2, 3, 3)
-            plt.plot(epochs, f1s[0], 'c-', linewidth=2, label='Train F1', marker='o', markersize=3)
-            plt.plot(epochs, f1s[1], 'y-', linewidth=2, label='Val F1', marker='s', markersize=3)
-            plt.xlabel('Epoch')
-            plt.ylabel('F1 Score')
-            plt.title(f'{model_name} F1 Curves')
-            plt.legend()
+        # 3. F1 curves if available
+        if f1s and len(f1s[0]) > 0 and len(f1s[1]) > 0:
+            plt.figure(figsize=(12, 8))
+            plt.plot(epochs, f1s[0], 'c-', linewidth=2, label='Training F1', marker='o', markersize=4)
+            plt.plot(epochs, f1s[1], 'y-', linewidth=2, label='Validation F1', marker='s', markersize=4)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('F1 Score', fontsize=12)
+            plt.title(f'{model_name} F1 Curves', fontsize=14, fontweight='bold')
+            plt.legend(fontsize=11)
             plt.grid(True, alpha=0.3)
             plt.ylim([0, 1])
+            plt.xticks(fontsize=10)
+            plt.yticks(fontsize=10)
+            plt.tight_layout()
+            f1_path = save_path.replace('_training_curves.png', '_f1_curves.png')
+            plt.savefig(f1_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"📊 DAE F1 curves saved to {f1_path}")
 
-        # Precision/Recall subplot
-        if aucs and f1s and len(aucs[0]) > 0 and len(f1s[0]) > 0:
-            plt.subplot(2, 3, 4)
-            plt.plot(epochs, aucs[0], 'g-', linewidth=2, label='Train AUC')
-            plt.plot(epochs, aucs[1], 'm-', linewidth=2, label='Val AUC')
-            plt.plot(epochs, f1s[0], 'c-', linewidth=2, label='Train F1')
-            plt.plot(epochs, f1s[1], 'y-', linewidth=2, label='Val F1')
-            plt.xlabel('Epoch')
-            plt.ylabel('Score')
-            plt.title(f'{model_name} Performance Metrics')
-            plt.legend()
+        # 4. Precision curves if available
+        if precisions and len(precisions[0]) > 0 and len(precisions[1]) > 0:
+            plt.figure(figsize=(12, 8))
+            plt.plot(epochs, precisions[0], 'purple', linewidth=2, label='Training Precision', marker='o', markersize=4)
+            plt.plot(epochs, precisions[1], 'orange', linewidth=2, label='Validation Precision', marker='s', markersize=4)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('Precision Score', fontsize=12)
+            plt.title(f'{model_name} Precision Curves', fontsize=14, fontweight='bold')
+            plt.legend(fontsize=11)
             plt.grid(True, alpha=0.3)
             plt.ylim([0, 1])
+            plt.xticks(fontsize=10)
+            plt.yticks(fontsize=10)
+            plt.tight_layout()
+            precision_path = save_path.replace('_training_curves.png', '_precision_curves.png')
+            plt.savefig(precision_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"📊 DAE precision curves saved to {precision_path}")
 
-        # Loss trend analysis
-        plt.subplot(2, 3, 5)
-        train_trend = np.polyfit(range(len(losses_dict['train'])), losses_dict['train'], 1)[0]
-        val_trend = np.polyfit(range(len(losses_dict['val'])), losses_dict['val'], 1)[0]
-        plt.plot(epochs, losses_dict['train'], 'b-', linewidth=2, label='.4f')
-        plt.plot(epochs, losses_dict['val'], 'r-', linewidth=2, label='.4f')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title(f'{model_name} Loss Trends')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-
-        # Performance summary
-        plt.subplot(2, 3, 6)
-        if aucs and f1s and len(aucs[0]) > 0 and len(f1s[0]) > 0:
-            final_train_auc = aucs[0][-1] if not np.isnan(aucs[0][-1]) else 0
-            final_val_auc = aucs[1][-1] if not np.isnan(aucs[1][-1]) else 0
-            final_train_f1 = f1s[0][-1] if not np.isnan(f1s[0][-1]) else 0
-            final_val_f1 = f1s[1][-1] if not np.isnan(f1s[1][-1]) else 0
-
-            metrics = ['Final Train AUC', 'Final Val AUC', 'Final Train F1', 'Final Val F1']
-            values = [final_train_auc, final_val_auc, final_train_f1, final_val_f1]
-            colors = ['green', 'magenta', 'cyan', 'yellow']
-
-            bars = plt.bar(metrics, values, color=colors, alpha=0.7)
-            plt.ylabel('Score')
-            plt.title(f'{model_name} Final Performance')
-            plt.xticks(rotation=45, ha='right')
+        # 5. Recall curves if available
+        if recalls and len(recalls[0]) > 0 and len(recalls[1]) > 0:
+            plt.figure(figsize=(12, 8))
+            plt.plot(epochs, recalls[0], 'brown', linewidth=2, label='Training Recall', marker='o', markersize=4)
+            plt.plot(epochs, recalls[1], 'pink', linewidth=2, label='Validation Recall', marker='s', markersize=4)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('Recall Score', fontsize=12)
+            plt.title(f'{model_name} Recall Curves', fontsize=14, fontweight='bold')
+            plt.legend(fontsize=11)
+            plt.grid(True, alpha=0.3)
             plt.ylim([0, 1])
-            plt.grid(True, alpha=0.3, axis='y')
+            plt.xticks(fontsize=10)
+            plt.yticks(fontsize=10)
+            plt.tight_layout()
+            recall_path = save_path.replace('_training_curves.png', '_recall_curves.png')
+            plt.savefig(recall_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"📊 DAE recall curves saved to {recall_path}")
 
-            # Add value labels
-            for bar, value in zip(bars, values):
-                plt.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01,
-                        '.3f', ha='center', va='bottom', fontsize=10)
+        # 6. Accuracy curves if available
+        if accuracies and len(accuracies[0]) > 0 and len(accuracies[1]) > 0:
+            plt.figure(figsize=(12, 8))
+            plt.plot(epochs, accuracies[0], 'olive', linewidth=2, label='Training Accuracy', marker='o', markersize=4)
+            plt.plot(epochs, accuracies[1], 'teal', linewidth=2, label='Validation Accuracy', marker='s', markersize=4)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('Accuracy Score', fontsize=12)
+            plt.title(f'{model_name} Accuracy Curves', fontsize=14, fontweight='bold')
+            plt.legend(fontsize=11)
+            plt.grid(True, alpha=0.3)
+            plt.ylim([0, 1])
+            plt.xticks(fontsize=10)
+            plt.yticks(fontsize=10)
+            plt.tight_layout()
+            accuracy_path = save_path.replace('_training_curves.png', '_accuracy_curves.png')
+            plt.savefig(accuracy_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"📊 DAE accuracy curves saved to {accuracy_path}")
 
-    else:
-        # VAE plots remain similar but can be extended
-        plt.figure(figsize=(16, 10))
-
-        plt.subplot(2, 2, 1)
-        plt.plot(epochs, losses_dict['train_total'], 'k-', linewidth=2, label='Train Total', marker='o', markersize=3)
-        plt.plot(epochs, losses_dict['val_total'], 'k--', linewidth=2, label='Val Total', marker='s', markersize=3)
-        plt.xlabel('Epoch')
-        plt.ylabel('Total Loss')
-        plt.title(f'{model_name} Total Loss')
-        plt.legend()
+    else:  # VAE
+        # 1. Total Loss curves
+        plt.figure(figsize=(12, 8))
+        plt.plot(epochs, losses_dict['train_total'], 'k-', linewidth=2, label='Training Total Loss', marker='o', markersize=4)
+        plt.plot(epochs, losses_dict['val_total'], 'k--', linewidth=2, label='Validation Total Loss', marker='s', markersize=4)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Total Loss', fontsize=12)
+        plt.title(f'{model_name} Total Loss Curves', fontsize=14, fontweight='bold')
+        plt.legend(fontsize=11)
         plt.grid(True, alpha=0.3)
+        plt.xticks(fontsize=10)
+        plt.yticks(fontsize=10)
+        plt.tight_layout()
+        total_loss_path = save_path.replace('_training_curves.png', '_total_loss_curves.png')
+        plt.savefig(total_loss_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"📊 VAE total loss curves saved to {total_loss_path}")
 
-        plt.subplot(2, 2, 2)
-        plt.plot(epochs, losses_dict['train_mse'], 'b-', linewidth=2, label='Train MSE', marker='o', markersize=3)
-        plt.plot(epochs, losses_dict['val_mse'], 'b--', linewidth=2, label='Val MSE', marker='s', markersize=3)
-        plt.xlabel('Epoch')
-        plt.ylabel('MSE Loss')
-        plt.title(f'{model_name} MSE Reconstruction Loss')
-        plt.legend()
+        # 2. MSE Loss curves
+        plt.figure(figsize=(12, 8))
+        plt.plot(epochs, losses_dict['train_mse'], 'b-', linewidth=2, label='Training MSE Loss', marker='o', markersize=4)
+        plt.plot(epochs, losses_dict['val_mse'], 'r-', linewidth=2, label='Validation MSE Loss', marker='s', markersize=4)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('MSE Reconstruction Loss', fontsize=12)
+        plt.title(f'{model_name} MSE Reconstruction Loss Curves', fontsize=14, fontweight='bold')
+        plt.legend(fontsize=11)
         plt.grid(True, alpha=0.3)
+        plt.xticks(fontsize=10)
+        plt.yticks(fontsize=10)
+        plt.tight_layout()
+        mse_loss_path = save_path.replace('_training_curves.png', '_mse_loss_curves.png')
+        plt.savefig(mse_loss_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"📊 VAE MSE loss curves saved to {mse_loss_path}")
 
-        plt.subplot(2, 2, 3)
-        plt.plot(epochs, losses_dict['train_kl'], 'r-', linewidth=2, label='Train KL', marker='o', markersize=3)
-        plt.plot(epochs, losses_dict['val_kl'], 'r--', linewidth=2, label='Val KL', marker='s', markersize=3)
-        plt.xlabel('Epoch')
-        plt.ylabel('KL Divergence Loss')
-        plt.title(f'{model_name} KL Divergence Loss')
-        plt.legend()
+        # 3. KL Divergence Loss curves
+        plt.figure(figsize=(12, 8))
+        plt.plot(epochs, losses_dict['train_kl'], 'r-', linewidth=2, label='Training KL Loss', marker='o', markersize=4)
+        plt.plot(epochs, losses_dict['val_kl'], 'orange', linewidth=2, label='Validation KL Loss', marker='s', markersize=4)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('KL Divergence Loss', fontsize=12)
+        plt.title(f'{model_name} KL Divergence Loss Curves', fontsize=14, fontweight='bold')
+        plt.legend(fontsize=11)
         plt.grid(True, alpha=0.3)
+        plt.xticks(fontsize=10)
+        plt.yticks(fontsize=10)
+        plt.tight_layout()
+        kl_loss_path = save_path.replace('_training_curves.png', '_kl_loss_curves.png')
+        plt.savefig(kl_loss_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"📊 VAE KL loss curves saved to {kl_loss_path}")
 
-        plt.subplot(2, 2, 4)
-        plt.plot(epochs, losses_dict['train_kl'], 'r-', linewidth=2, label='KL Loss', marker='o', markersize=3)
-        plt.plot(epochs, losses_dict['train_mse'], 'b-', linewidth=2, label='MSE Loss', marker='^', markersize=3)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss Components')
-        plt.title(f'{model_name} Loss Component Evolution')
-        plt.legend()
+        # 4. Loss Components Evolution
+        plt.figure(figsize=(12, 8))
+        plt.plot(epochs, losses_dict['train_kl'], 'r-', linewidth=2, label='KL Divergence Loss', marker='o', markersize=4)
+        plt.plot(epochs, losses_dict['train_mse'], 'b-', linewidth=2, label='MSE Reconstruction Loss', marker='^', markersize=4)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Loss Components', fontsize=12)
+        plt.title(f'{model_name} Loss Component Evolution', fontsize=14, fontweight='bold')
+        plt.legend(fontsize=11)
         plt.grid(True, alpha=0.3)
+        plt.xticks(fontsize=10)
+        plt.yticks(fontsize=10)
+        plt.tight_layout()
+        components_path = save_path.replace('_training_curves.png', '_loss_components.png')
+        plt.savefig(components_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"📊 VAE loss components saved to {components_path}")
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    print(f"📊 Enhanced training curves saved to {save_path}")
+    print(f"📊 Individual training curves for {model_name} saved to results/visualizations/")
 
 def setup_training_logging():
     """Setup comprehensive logging for defense sensor training monitoring."""
@@ -735,7 +868,10 @@ def main():
     # Plot DAE training curves with comprehensive metrics
     losses_dict_dae = {'train': train_losses_dae, 'val': val_losses_dae}
     plot_training_curves(losses_dict_dae, 'DAE', 'results/visualizations/dae_training_curves.png',
-                        aucs=(train_aucs_dae, val_aucs_dae), f1s=(train_f1s_dae, val_f1s_dae))
+                        aucs=(train_aucs_dae, val_aucs_dae), f1s=(train_f1s_dae, val_f1s_dae),
+                        precisions=(train_precisions_dae, val_precisions_dae),
+                        recalls=(train_recalls_dae, val_recalls_dae),
+                        accuracies=(train_accuracies_dae, val_accuracies_dae))
 
     # Log final DAE metrics
     if train_aucs_dae and val_aucs_dae:
@@ -752,17 +888,30 @@ def main():
         print("\n✈️ PHASE 2: Training VAE for IMS Bearing Vibration Anomaly Detection")
         logger.info("Starting VAE training for IMS bearing anomaly detection")
         vae_model = create_vae_ims()
-        trained_vae, train_total_vae, train_mse_vae, train_kl_vae, val_total_vae, val_mse_vae, val_kl_vae = train_vae(
+        trained_vae, train_total_vae, train_mse_vae, train_kl_vae, val_total_vae, val_mse_vae, val_kl_vae, train_aucs_vae, val_aucs_vae, train_f1s_vae, val_f1s_vae, train_precisions_vae, val_precisions_vae, train_recalls_vae, val_recalls_vae, train_accuracies_vae, val_accuracies_vae = train_vae(
             vae_model, ims_train_loader, ims_val_loader, device,
             epochs=epochs, lr=learning_rate, patience=patience
         )
 
-        # Plot VAE training curves
+        # Plot VAE training curves with comprehensive metrics
         losses_dict_vae = {
             'train_total': train_total_vae, 'train_mse': train_mse_vae, 'train_kl': train_kl_vae,
             'val_total': val_total_vae, 'val_mse': val_mse_vae, 'val_kl': val_kl_vae
         }
-        plot_training_curves(losses_dict_vae, 'VAE', 'results/visualizations/vae_training_curves.png')
+        plot_training_curves(losses_dict_vae, 'VAE', 'results/visualizations/vae_training_curves.png',
+                            aucs=(train_aucs_vae, val_aucs_vae), f1s=(train_f1s_vae, val_f1s_vae),
+                            precisions=(train_precisions_vae, val_precisions_vae),
+                            recalls=(train_recalls_vae, val_recalls_vae),
+                            accuracies=(train_accuracies_vae, val_accuracies_vae))
+
+        # Log final VAE metrics
+        if train_aucs_vae and val_aucs_vae:
+            logger.info(f"VAE Final Metrics - Train AUC: {train_aucs_vae[-1]:.4f}, Val AUC: {val_aucs_vae[-1]:.4f}")
+            logger.info(f"VAE Final Metrics - Train F1: {train_f1s_vae[-1]:.4f}, Val F1: {val_f1s_vae[-1]:.4f}")
+            logger.info(f"VAE Final Metrics - Train Precision: {train_precisions_vae[-1]:.4f}, Val Precision: {val_precisions_vae[-1]:.4f}")
+            logger.info(f"VAE Final Metrics - Train Recall: {train_recalls_vae[-1]:.4f}, Val Recall: {val_recalls_vae[-1]:.4f}")
+            logger.info(f"VAE Final Metrics - Train Accuracy: {train_accuracies_vae[-1]:.4f}, Val Accuracy: {val_accuracies_vae[-1]:.4f}")
+
         logger.info("VAE training completed and curves plotted")
     else:
         trained_vae = None
@@ -784,6 +933,9 @@ def main():
         print(f"   VAE (IMS): Trained with {len(train_total_vae)} epochs")
         print(f"   Final Train Loss: {train_total_vae[-1]:.6f}")
         print(f"   Final Val Loss: {val_total_vae[-1]:.6f}")
+        if 'train_aucs_vae' in locals() and train_aucs_vae and val_aucs_vae:
+            print(f"   Final Train F1: {train_f1s_vae[-1]:.4f}, AUC: {train_aucs_vae[-1]:.4f}")
+            print(f"   Final Val F1: {val_f1s_vae[-1]:.4f}, AUC: {val_aucs_vae[-1]:.4f}")
         print(f"   Model saved to: checkpoints/vae_ims_best.pth")
 
     print("📈 Visualizations saved to: results/visualizations/")

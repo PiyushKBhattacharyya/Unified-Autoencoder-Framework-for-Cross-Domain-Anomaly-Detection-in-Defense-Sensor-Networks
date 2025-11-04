@@ -103,9 +103,9 @@ def compute_reconstruction_errors(model, data_loader, model_type='dae', device='
                 errors.extend(per_sample_errors)
             elif model_type == 'vae':
                 reconstructed, _, _ = model(inputs)
-                _, mse_loss, _ = model.loss_function(reconstructed, inputs, torch.zeros_like(inputs), torch.zeros_like(inputs))
-                # For VAE, use mean MSE across batch for simplicity, but ideally should be per-sample
-                errors.append(mse_loss.item())
+                # Compute per-sample MSE errors (mean over all dimensions for each sample)
+                per_sample_errors = torch.mean((reconstructed - inputs) ** 2, dim=[1, 2]).detach().cpu().numpy()
+                errors.extend(per_sample_errors)
 
             # Latency in milliseconds per sample
             latency = (time.time() - start_time) * 1000 / inputs.size(0)

@@ -6,6 +6,7 @@ import logging
 from datetime import datetime
 import time
 from tabulate import tabulate
+import pandas as pd
 
 # Import custom modules for defense sensor anomaly detection
 from data_loader import load_sonar_data, load_ims_data, set_random_seed
@@ -135,11 +136,9 @@ class DefenseAnomalyDetector:
 
         # Defense-optimized data loading with parallel processing and prefetching
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                                num_workers=4, pin_memory=True, persistent_workers=True,
-                                prefetch_factor=2)
+                                num_workers=0, pin_memory=False)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                              num_workers=4, pin_memory=True, persistent_workers=True,
-                              prefetch_factor=2)
+                               num_workers=0, pin_memory=False)
 
         # Train with defense-specific hyperparameters
         start_time = time.time()
@@ -152,8 +151,20 @@ class DefenseAnomalyDetector:
             losses_dict = {'train': train_losses, 'val': val_losses}
             aucs = (train_aucs, val_aucs)
             f1s = (train_f1s, val_f1s)
+            precisions = (train_precisions, val_precisions)
+            recalls = (train_recalls, val_recalls)
+            accuracies = (train_accuracies, val_accuracies)
+            # Extract final metrics for visualization
+            final_metrics = {
+                'train_precision': train_precisions[-1] if train_precisions else None,
+                'val_precision': val_precisions[-1] if val_precisions else None,
+                'train_recall': train_recalls[-1] if train_recalls else None,
+                'val_recall': val_recalls[-1] if val_recalls else None,
+                'train_accuracy': train_accuracies[-1] if train_accuracies else None,
+                'val_accuracy': val_accuracies[-1] if val_accuracies else None
+            }
         else:
-            trained_model, train_total, train_mse, train_kl, val_total, val_mse, val_kl = train_vae(
+            trained_model, train_total, train_mse, train_kl, val_total, val_mse, val_kl, *metrics = train_vae(
                 model, train_loader, val_loader, self.device,
                 epochs=self.config['epochs'], lr=self.config['learning_rate'], patience=15
             )
@@ -161,15 +172,19 @@ class DefenseAnomalyDetector:
                           'val_total': val_total, 'val_mse': val_mse, 'val_kl': val_kl}
             aucs = None
             f1s = None
+            final_metrics = None  # VAE doesn't have classification metrics during training
 
         training_time = time.time() - start_time
         self.logger.info(f"{model_type} training completed in {training_time:.2f} seconds")
 
         # Generate training curve visualizations
         viz_path = f"results/visualizations/{model_type.lower()}_training_curves.png"
-        plot_training_curves(losses_dict, model_type, viz_path, aucs, f1s)
+        if model_type == 'DAE':
+            plot_training_curves(losses_dict, model_type, viz_path, aucs, f1s, final_metrics, precisions, recalls, accuracies)
+        else:
+            plot_training_curves(losses_dict, model_type, viz_path, aucs, f1s, final_metrics)
 
-        return trained_model, losses_dict
+        return trained_model, losses_dict, final_metrics
 
     def evaluate_and_visualize(self, dataset_type):
         """
@@ -227,9 +242,11 @@ class DefenseAnomalyDetector:
             y_val = torch.LongTensor(y_val)
 
             # Phase 2: Model Creation and Training
-            print("\n🤖 PHASE 2: MODEL TRAINING")
+            model_name = "DAE" if dataset_type == 'sonar' else "VAE"
+            dataset_name = "Sonar" if dataset_type == 'sonar' else "IMS"
+            print(f"\n🤖 PHASE 2: TRAINING {model_name} FOR {dataset_name.upper()} ANOMALY DETECTION")
             model, model_type = self.create_model(dataset_type)
-            trained_model, losses_dict = self.train_model(
+            trained_model, losses_dict, final_train_metrics = self.train_model(
                 model, X_train, X_val, y_train, y_val, model_type
             )
 
@@ -239,7 +256,10 @@ class DefenseAnomalyDetector:
 
             # Phase 4: Results Summary
             total_time = time.time() - start_time
-            self.generate_results_summary(dataset_type, model_type, total_time)
+            self.generate_results_summary(dataset_type, model_type, total_time, final_train_metrics if model_type == 'DAE' else None)
+
+            # Save final results to CSV
+            self.save_results_summary(dataset_type, model_type, total_time, losses_dict, final_train_metrics)
 
             print("\n✅ DEFENSE ANOMALY DETECTION PIPELINE COMPLETED SUCCESSFULLY")
             print("=" * 70)
@@ -252,7 +272,7 @@ class DefenseAnomalyDetector:
             print(f"❌ Pipeline failed: {str(e)}")
             raise
 
-    def generate_results_summary(self, dataset_type, model_type, total_time):
+    def generate_results_summary(self, dataset_type, model_type, total_time, final_train_metrics=None):
         """
         Generate comprehensive results summary in tabular format.
 
@@ -276,7 +296,7 @@ class DefenseAnomalyDetector:
             lines = eval_content.split('\n')
             for line in lines:
                 if 'threshold:' in line and ('Precision:' in line or 'F1 Score:' in line):
-                    parts = line.split(',')
+                    parts = line.split(', ')
                     threshold = parts[0].split(':')[1].strip()
                     precision = parts[1].split(':')[1].strip()
                     recall = parts[2].split(':')[1].strip()
@@ -308,7 +328,73 @@ class DefenseAnomalyDetector:
             ["Logs Available", "results/logs/"]
         ]
 
+        if final_train_metrics:
+            summary_data.extend([
+                ["Final Train Precision", f"{final_train_metrics['train_precision']:.4f}"],
+                ["Final Val Precision", f"{final_train_metrics['val_precision']:.4f}"],
+                ["Final Train Recall", f"{final_train_metrics['train_recall']:.4f}"],
+                ["Final Val Recall", f"{final_train_metrics['val_recall']:.4f}"],
+                ["Final Train Accuracy", f"{final_train_metrics['train_accuracy']:.4f}"],
+                ["Final Val Accuracy", f"{final_train_metrics['val_accuracy']:.4f}"]
+            ])
+
         print("\n" + tabulate(summary_data, tablefmt="grid"))
+
+        # Performance table for both models
+        if os.path.exists('results/evaluation/evaluation.log'):
+            print("\n📊 MODEL PERFORMANCE SUMMARY TABLE")
+            print("-" * 80)
+            table_data = []
+            headers = ["Dataset", "Model", "Train Loss", "Val Loss", "AUROC", "F1", "Latency", "Accuracy", "Precision", "Recall"]
+
+            # Read evaluation log to extract metrics
+            with open('results/evaluation/evaluation.log', 'r') as f:
+                log_content = f.read()
+
+            # Parse metrics for current model
+            model_name = "DAE" if model_type == "DAE" else "VAE"
+            dataset_name = self.config['dataset'].upper()
+
+            # Extract final training losses from training logs
+            train_loss = "N/A"
+            val_loss = "N/A"
+            if os.path.exists('results/logs/train.log'):
+                with open('results/logs/train.log', 'r') as f:
+                    train_log = f.read()
+                    # Extract final losses (simplified)
+                    if 'Final Metrics' in train_log:
+                        lines = train_log.split('\n')
+                        for line in lines:
+                            if 'Final Train Loss:' in line:
+                                train_loss = line.split(':')[1].strip()
+                            elif 'Final Val Loss:' in line:
+                                val_loss = line.split(':')[1].strip()
+
+            # Extract evaluation metrics
+            auroc = "N/A"
+            f1 = "N/A"
+            latency = "N/A"
+            accuracy = "N/A"
+            precision = "N/A"
+            recall = "N/A"
+
+            lines = log_content.split('\n')
+            for line in lines:
+                if 'AUROC:' in line and auroc == "N/A":
+                    auroc = line.split('AUROC:')[1].strip()
+                elif 'F1 Score:' in line and f1 == "N/A":
+                    f1 = line.split('F1 Score:')[1].strip()
+                elif 'Average latency:' in line:
+                    latency = line.split('Average latency:')[1].split('ms')[0].strip() + "ms"
+
+            if final_train_metrics:
+                accuracy = f"{final_train_metrics['val_accuracy']:.4f}"
+                precision = f"{final_train_metrics['val_precision']:.4f}"
+                recall = f"{final_train_metrics['val_recall']:.4f}"
+
+            table_data.append([dataset_name, model_name, train_loss, val_loss, auroc, f1, latency, accuracy, precision, recall])
+
+            print(tabulate(table_data, headers=headers, tablefmt="grid"))
 
         # Defense readiness assessment
         print("\n🛡️ DEFENSE READINESS ASSESSMENT")
@@ -319,6 +405,77 @@ class DefenseAnomalyDetector:
         print("✅ Comprehensive logging enabled")
         print("✅ Reproducibility ensured with seeds")
         print("🛡️ SYSTEM READY FOR OPERATIONAL THREAT DETECTION")
+
+    def save_results_summary(self, dataset_type, model_type, total_time, losses_dict, final_train_metrics=None):
+        """
+        Save final results including loss and evaluation metrics to CSV file.
+
+        Parameters:
+        dataset_type (str): 'sonar' or 'ims'
+        model_type (str): 'DAE' or 'VAE'
+        total_time (float): Total training time in seconds
+        losses_dict (dict): Dictionary containing training losses
+        final_train_metrics (dict): Final training metrics (for DAE only)
+        """
+        os.makedirs('results/summary', exist_ok=True)
+
+        # Prepare results dictionary
+        results = {
+            'Dataset': dataset_type.upper(),
+            'Model': model_type,
+            'Total_Training_Time_s': round(total_time, 2),
+            'Epochs_Trained': self.config['epochs'],
+            'Batch_Size': self.config['batch_size'],
+            'Learning_Rate': self.config['learning_rate'],
+            'Random_Seed': self.config['seed'],
+            'Device': str(self.device)
+        }
+
+        # Add final losses
+        if model_type == 'DAE':
+            results['Final_Train_Loss'] = losses_dict['train'][-1] if losses_dict['train'] else None
+            results['Final_Val_Loss'] = losses_dict['val'][-1] if losses_dict['val'] else None
+        else:
+            results['Final_Train_Total_Loss'] = losses_dict['train_total'][-1] if losses_dict['train_total'] else None
+            results['Final_Train_MSE_Loss'] = losses_dict['train_mse'][-1] if losses_dict['train_mse'] else None
+            results['Final_Train_KL_Loss'] = losses_dict['train_kl'][-1] if losses_dict['train_kl'] else None
+            results['Final_Val_Total_Loss'] = losses_dict['val_total'][-1] if losses_dict['val_total'] else None
+            results['Final_Val_MSE_Loss'] = losses_dict['val_mse'][-1] if losses_dict['val_mse'] else None
+            results['Final_Val_KL_Loss'] = losses_dict['val_kl'][-1] if losses_dict['val_kl'] else None
+
+        # Add final training metrics for DAE
+        if final_train_metrics and model_type == 'DAE':
+            results['Final_Train_Precision'] = final_train_metrics['train_precision']
+            results['Final_Val_Precision'] = final_train_metrics['val_precision']
+            results['Final_Train_Recall'] = final_train_metrics['train_recall']
+            results['Final_Val_Recall'] = final_train_metrics['val_recall']
+            results['Final_Train_Accuracy'] = final_train_metrics['train_accuracy']
+            results['Final_Val_Accuracy'] = final_train_metrics['val_accuracy']
+
+        # Try to extract evaluation metrics from log files
+        eval_log_path = 'results/evaluation/evaluation.log'
+        if os.path.exists(eval_log_path):
+            try:
+                with open(eval_log_path, 'r') as f:
+                    log_content = f.read()
+
+                lines = log_content.split('\n')
+                for line in lines:
+                    if 'AUROC:' in line:
+                        results['AUROC'] = float(line.split('AUROC:')[1].strip())
+                    elif 'F1 Score:' in line:
+                        results['F1_Score'] = float(line.split('F1 Score:')[1].strip())
+                    elif 'Average latency:' in line:
+                        latency_str = line.split('Average latency:')[1].split('ms')[0].strip()
+                        results['Average_Latency_ms'] = float(latency_str)
+            except Exception as e:
+                self.logger.warning(f"Could not extract evaluation metrics from log: {e}")
+
+        # Save to CSV
+        filename = f"results/summary/{model_type.lower()}_results.csv"
+        df = pd.DataFrame([results])
+        df.to_csv(filename, index=False)
+        print(f"💾 Results saved to {filename}")
 
 
 def parse_arguments():

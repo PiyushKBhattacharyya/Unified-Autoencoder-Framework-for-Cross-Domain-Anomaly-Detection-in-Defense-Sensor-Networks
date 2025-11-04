@@ -43,6 +43,7 @@ def load_and_prepare_data(model_type='dae'):
         if X_data.size == 0:
             return None, None, None
         X_tensor = torch.FloatTensor(X_data)
+        X_tensor = X_tensor.permute(0, 2, 1)  # Transpose for Conv1D: (batch, window_size, channels) -> (batch, channels, window_size)
         y_tensor = torch.LongTensor(y_data)
         batch_size = 16
     else:
@@ -464,6 +465,7 @@ def visualize_ims_anomalies(model, data_loader, device):
             recon_np = reconstructed.cpu().numpy()
 
             # Compute MSE per time step across all channels and batch
+            # For VAE: inputs shape is (batch, channels, window_size), errors shape is (batch, channels, window_size)
             time_errors = np.mean((orig_np - recon_np)**2, axis=(0, 1))  # Shape: (window_size,)
             time_errors_list.append(time_errors)
 
@@ -477,7 +479,7 @@ def visualize_ims_anomalies(model, data_loader, device):
 
         # 1. Time-Domain Error Plot
         create_time_domain_error_plot_ims(avg_time_errors, time_indices,
-                                         'results/visualizations/ims/time_domain_errors.png')
+                                          'results/visualizations/ims/time_domain_errors.png')
 
         # 2. Error Distribution Analysis
         create_error_distribution_plots(errors, labels, 'vae',
@@ -514,8 +516,10 @@ def visualize_ims_anomalies(model, data_loader, device):
                     break
 
         create_denoised_comparison_plots(np.array(original_clean), np.array(denoised_samples),
-                                        np.array(noisy_samples), 'vae',
-                                        'results/visualizations/ims/denoising_comparison.png')
+                                         np.array(noisy_samples), 'vae',
+                                         'results/visualizations/ims/denoising_comparison.png')
+
+    print(f"✅ IMS bearing anomaly visualizations completed successfully")
 
 
 def setup_visualization_logging():

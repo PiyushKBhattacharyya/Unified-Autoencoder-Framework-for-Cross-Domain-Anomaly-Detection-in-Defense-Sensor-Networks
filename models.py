@@ -268,6 +268,11 @@ class VariationalAutoencoder(nn.Module):
 
     def forward(self, x):
         """Forward pass through VAE."""
+        # Handle input shape flexibility: (batch, window_size, channels) or (batch, channels, window_size)
+        if x.dim() == 3 and x.shape[1] == self.window_size:
+            # Transpose from (batch, window_size, channels) to (batch, channels, window_size)
+            x = x.permute(0, 2, 1)
+
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         reconstructed = self.decode(z)
