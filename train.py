@@ -245,6 +245,10 @@ def train_dae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
 
         print(f"Epoch {epoch+1:3d}/{epochs} | Train Loss: {avg_train_loss:.6f} F1: {train_f1:.3f} AUC: {train_auc:.3f} | Val Loss: {avg_val_loss:.6f} F1: {val_f1:.3f} AUC: {val_auc:.3f} | LR: {current_lr:.6f}")
 
+        # Log additional defense metrics for operational monitoring
+        logger.info(f"Defense Metrics - Train Precision: {train_precision:.4f}, Recall: {train_recall:.4f}, Accuracy: {train_accuracy:.4f}")
+        logger.info(f"Defense Metrics - Val Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, Accuracy: {val_accuracy:.4f}")
+
         # Early stopping check
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -279,6 +283,8 @@ def train_dae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
         else:
             model.load_state_dict(best_model_state)
 
+    # Defense Application: Comprehensive metrics tracking enables detailed performance analysis
+    # for operational anomaly detection deployment in defense sensor networks
     return model, train_losses, val_losses, train_aucs, val_aucs, train_f1s, val_f1s, train_precisions, val_precisions, train_recalls, val_recalls, train_accuracies, val_accuracies
 
 def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, patience=10):

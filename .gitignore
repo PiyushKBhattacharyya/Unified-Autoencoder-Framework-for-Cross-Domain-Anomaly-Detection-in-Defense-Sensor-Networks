@@ -4,4 +4,3 @@ venv
 **/*visualizations
 *.pth
 **/__pycache__/
-checkpoints/

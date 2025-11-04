@@ -140,24 +140,25 @@ def determine_anomaly_thresholds(reconstruction_errors, labels, strategies=['per
     """
     thresholds = {}
 
+    # Debug: Check array sizes for alignment
+    print(f"Debug: reconstruction_errors shape: {reconstruction_errors.shape}, labels shape: {labels.shape}")
+
     # Percentile-based threshold (common in defense applications)
     if 'percentile' in strategies:
-        # Use percentile of normal samples (assuming most data is normal)
-        normal_errors = reconstruction_errors[labels == 0]
-        if len(normal_errors) > 0:
-            thresholds['percentile_95'] = np.percentile(normal_errors, 95)
-            thresholds['percentile_99'] = np.percentile(normal_errors, 99)
-            thresholds['percentile_999'] = np.percentile(normal_errors, 99.9)
+        # Use percentile of all samples (since we don't have clear normal/anomalous separation in validation)
+        if len(reconstruction_errors) > 0:
+            thresholds['percentile_95'] = np.percentile(reconstruction_errors, 95)
+            thresholds['percentile_99'] = np.percentile(reconstruction_errors, 99)
+            thresholds['percentile_999'] = np.percentile(reconstruction_errors, 99.9)
 
-    # Statistical threshold (mean + k*std of normal samples)
+    # Statistical threshold (mean + k*std of all samples)
     if 'statistical' in strategies:
-        normal_errors = reconstruction_errors[labels == 0]
-        if len(normal_errors) > 0:
-            mean_normal = np.mean(normal_errors)
-            std_normal = np.std(normal_errors)
-            thresholds['statistical_2std'] = mean_normal + 2 * std_normal
-            thresholds['statistical_3std'] = mean_normal + 3 * std_normal
-            thresholds['statistical_4std'] = mean_normal + 4 * std_normal
+        if len(reconstruction_errors) > 0:
+            mean_all = np.mean(reconstruction_errors)
+            std_all = np.std(reconstruction_errors)
+            thresholds['statistical_2std'] = mean_all + 2 * std_all
+            thresholds['statistical_3std'] = mean_all + 3 * std_all
+            thresholds['statistical_4std'] = mean_all + 4 * std_all
 
     print("🎯 Determined anomaly thresholds:")
     for strategy, threshold in thresholds.items():
@@ -428,18 +429,36 @@ def evaluate_vae_model(checkpoint_path='checkpoints/vae_ims_best.pth', device='c
             print("❌ IMS dataset not available. Skipping VAE evaluation.")
             return
 
-        X_ims = torch.FloatTensor(X_ims)
-        y_ims = torch.LongTensor(y_ims)
+        # Use the same validation split as training for consistency
+        from train import create_validation_split
+        X_ims_train, X_ims_val, y_ims_train, y_ims_val = create_validation_split(
+            X_ims, y_ims, val_split=0.1, seed=42
+        )
 
-        # Create data loader
+        X_ims_val = torch.FloatTensor(X_ims_val)
+        y_ims_val = torch.LongTensor(y_ims_val)
+
+        # Transpose IMS data for Conv1D: (batch, window_size, channels) -> (batch, channels, window_size)
+        X_ims_val = X_ims_val.permute(0, 2, 1)
+
+        # Create data loader with validation data only (like training)
         from torch.utils.data import TensorDataset, DataLoader
-        test_dataset = TensorDataset(X_ims, y_ims)
+        test_dataset = TensorDataset(X_ims_val, y_ims_val)
         test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+
+        # Store validation labels for threshold determination
+        y_ims_val_np = y_ims_val.numpy()
 
         # Compute reconstruction errors and latencies
         errors, originals, labels, latencies = compute_reconstruction_errors(
             model, test_loader, 'vae', device
         )
+
+        # Use the validation labels we stored earlier instead of the ones from compute_reconstruction_errors
+        # This ensures size consistency for threshold determination
+        # We need to match the exact number of samples that were processed
+        n_samples = len(errors)
+        labels = y_ims_val_np[:n_samples]  # Take only the first n_samples labels
 
         # Determine thresholds
         thresholds = determine_anomaly_thresholds(errors, labels)
