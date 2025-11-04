@@ -1,0 +1,7 @@
+UCI Sonar Dataset Statistics
+==============================
+Total samples: 208
+Features per sample: 60
+Normal samples (Rocks): 97 (46.6%)
+Anomalous samples (Mines): 111 (53.4%)
+Defense Application: Underwater acoustic threat detection
