@@ -80,7 +80,7 @@ def train_dae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
         print(f"🚀 Using DataParallel with {torch.cuda.device_count()} GPUs")
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
 
     # Early stopping parameters
     best_val_loss = float('inf')
@@ -139,7 +139,7 @@ def train_dae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
                 reconstructed, latent = model(noisy_inputs)
 
             optimizer.zero_grad()
-            loss = model.loss_function(reconstructed, inputs)
+            loss = model.loss_function(reconstructed, inputs, labels_batch)
             loss.backward()
             optimizer.step()
 
@@ -202,7 +202,7 @@ def train_dae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
                 else:
                     reconstructed, _ = model(inputs)
 
-                loss = model.loss_function(reconstructed, inputs)
+                loss = model.loss_function(reconstructed, inputs, labels_batch)
                 val_loss += loss.item()
 
                 # Collect errors and labels for validation metrics (per-sample MSE)
@@ -273,6 +273,20 @@ def train_dae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
                 print(f"⏹️ Early stopping triggered after {epoch+1} epochs (patience: {patience})")
                 break
 
+        # Save model every 50 epochs to capture training progress
+        if (epoch + 1) % 50 == 0:
+            checkpoint_path_epoch = f'checkpoints/dae_sonar_epoch_{epoch+1}.pth'
+            state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': state_dict,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
+                'lr': current_lr
+            }, checkpoint_path_epoch)
+            print(f"💾 Model checkpoint saved at epoch {epoch+1} to {checkpoint_path_epoch}")
+
         model.train()
 
     # Load best model (handle DataParallel)
@@ -301,7 +315,7 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
         print(f"🚀 Using DataParallel with {torch.cuda.device_count()} GPUs")
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
 
     # Early stopping parameters
     best_val_loss = float('inf')
@@ -371,7 +385,7 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
                 reconstructed, mu, logvar = model(inputs)
 
             optimizer.zero_grad()
-            total_loss, mse_loss, kl_loss = model.loss_function(reconstructed, inputs, mu, logvar)
+            total_loss, mse_loss, kl_loss = model.loss_function(reconstructed, inputs, mu, logvar, labels_batch)
             total_loss.backward()
             optimizer.step()
 
@@ -447,7 +461,7 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
                 else:
                     reconstructed, mu, logvar = model(inputs)
 
-                total_loss, mse_loss, kl_loss = model.loss_function(reconstructed, inputs, mu, logvar)
+                total_loss, mse_loss, kl_loss = model.loss_function(reconstructed, inputs, mu, logvar, labels_batch)
 
                 val_total += total_loss.item()
                 val_mse += mse_loss.item()
@@ -534,7 +548,55 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
                 print(f"⏹️ Early stopping triggered after {epoch+1} epochs (patience: {patience})")
                 break
 
+        # Save model every 50 epochs to capture training progress
+        if (epoch + 1) % 50 == 0:
+            checkpoint_path_epoch = f'checkpoints/vae_ims_epoch_{epoch+1}.pth'
+            state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': state_dict,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': avg_train_total,
+                'val_loss': avg_val_total,
+                'lr': current_lr
+            }, checkpoint_path_epoch)
+            print(f"💾 Model checkpoint saved at epoch {epoch+1} to {checkpoint_path_epoch}")
+
         model.train()
+
+    # Save final model if it has lower validation loss than the best saved model
+    final_val_loss = val_losses[-1] if val_losses else float('inf')
+    if final_val_loss < best_val_loss:
+        print(f"💾 Saving final model as it has lower validation loss ({final_val_loss:.6f}) than best saved ({best_val_loss:.6f})")
+        checkpoint_path_final = 'checkpoints/dae_sonar_final.pth'
+        state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+        torch.save({
+            'epoch': len(train_losses) - 1,
+            'model_state_dict': state_dict,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': train_losses[-1],
+            'val_loss': final_val_loss,
+            'lr': current_lr
+        }, checkpoint_path_final)
+        best_val_loss = final_val_loss
+        best_model_state = state_dict
+
+    # Save final model if it has lower validation loss than the best saved model
+    final_val_loss = val_total_losses[-1] if val_total_losses else float('inf')
+    if final_val_loss < best_val_loss:
+        print(f"💾 Saving final model as it has lower validation loss ({final_val_loss:.6f}) than best saved ({best_val_loss:.6f})")
+        checkpoint_path_final = 'checkpoints/vae_ims_final.pth'
+        state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+        torch.save({
+            'epoch': len(train_total_losses) - 1,
+            'model_state_dict': state_dict,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': train_total_losses[-1],
+            'val_loss': final_val_loss,
+            'lr': current_lr
+        }, checkpoint_path_final)
+        best_val_loss = final_val_loss
+        best_model_state = state_dict
 
     # Load best model (handle DataParallel)
     if best_model_state is not None:
@@ -784,9 +846,9 @@ def main():
     # Hyperparameters optimized for faster training with batch processing
     batch_size_sonar = 64  # Increased for better GPU utilization
     batch_size_ims = 32    # Increased for better GPU utilization
-    epochs = 100
+    epochs = 200  # Increased epochs to allow longer training
     learning_rate = 1e-3
-    patience = 15
+    patience = 50  # Set patience to 50 to allow models to train longer before early stopping
     val_split = 0.1
     num_workers = 4  # Parallel data loading for faster training
 
@@ -862,7 +924,7 @@ def main():
     dae_model = create_dae_sonar()
     trained_dae, train_losses_dae, val_losses_dae, train_aucs_dae, val_aucs_dae, train_f1s_dae, val_f1s_dae, train_precisions_dae, val_precisions_dae, train_recalls_dae, val_recalls_dae, train_accuracies_dae, val_accuracies_dae = train_dae(
         dae_model, sonar_train_loader, sonar_val_loader, device,
-        epochs=epochs, lr=learning_rate, patience=patience
+        epochs=epochs, lr=learning_rate, patience=50
     )
 
     # Plot DAE training curves with comprehensive metrics
@@ -890,7 +952,7 @@ def main():
         vae_model = create_vae_ims()
         trained_vae, train_total_vae, train_mse_vae, train_kl_vae, val_total_vae, val_mse_vae, val_kl_vae, train_aucs_vae, val_aucs_vae, train_f1s_vae, val_f1s_vae, train_precisions_vae, val_precisions_vae, train_recalls_vae, val_recalls_vae, train_accuracies_vae, val_accuracies_vae = train_vae(
             vae_model, ims_train_loader, ims_val_loader, device,
-            epochs=epochs, lr=learning_rate, patience=patience
+            epochs=epochs, lr=learning_rate, patience=50
         )
 
         # Plot VAE training curves with comprehensive metrics

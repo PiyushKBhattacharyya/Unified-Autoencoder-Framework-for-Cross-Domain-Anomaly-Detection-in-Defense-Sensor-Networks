@@ -123,7 +123,7 @@ def compute_reconstruction_errors(model, data_loader, model_type='dae', device='
 
     return errors, originals, labels, latencies
 
-def determine_anomaly_thresholds(reconstruction_errors, labels, strategies=['percentile', 'statistical', 'optimized']):
+def determine_anomaly_thresholds(reconstruction_errors, labels, strategies=['percentile', 'statistical', 'optimized', 'precision_optimized']):
     """
     Determine anomaly detection thresholds using multiple strategies.
 
@@ -143,45 +143,81 @@ def determine_anomaly_thresholds(reconstruction_errors, labels, strategies=['per
     # Debug: Check array sizes for alignment
     print(f"Debug: reconstruction_errors shape: {reconstruction_errors.shape}, labels shape: {labels.shape}")
 
-    # Percentile-based threshold (common in defense applications)
+    # Percentile-based threshold (common in defense applications) - lowered for higher sensitivity
     if 'percentile' in strategies:
         # Use percentile of all samples (since we don't have clear normal/anomalous separation in validation)
         if len(reconstruction_errors) > 0:
+            thresholds['percentile_70'] = np.percentile(reconstruction_errors, 70)
+            thresholds['percentile_75'] = np.percentile(reconstruction_errors, 75)
+            thresholds['percentile_80'] = np.percentile(reconstruction_errors, 80)
+            thresholds['percentile_85'] = np.percentile(reconstruction_errors, 85)
+            thresholds['percentile_90'] = np.percentile(reconstruction_errors, 90)
             thresholds['percentile_95'] = np.percentile(reconstruction_errors, 95)
             thresholds['percentile_99'] = np.percentile(reconstruction_errors, 99)
             thresholds['percentile_999'] = np.percentile(reconstruction_errors, 99.9)
 
-    # Statistical threshold (mean + k*std of all samples)
+    # Statistical threshold (mean + k*std of all samples) - lowered for higher sensitivity
     if 'statistical' in strategies:
         if len(reconstruction_errors) > 0:
             mean_all = np.mean(reconstruction_errors)
             std_all = np.std(reconstruction_errors)
+            thresholds['statistical_0_5std'] = mean_all + 0.5 * std_all
+            thresholds['statistical_0_75std'] = mean_all + 0.75 * std_all
+            thresholds['statistical_1std'] = mean_all + 1 * std_all
+            thresholds['statistical_1_5std'] = mean_all + 1.5 * std_all
             thresholds['statistical_2std'] = mean_all + 2 * std_all
             thresholds['statistical_3std'] = mean_all + 3 * std_all
             thresholds['statistical_4std'] = mean_all + 4 * std_all
 
-    # Optimized threshold based on F1-score
+    # Optimized threshold based on weighted F1-score heavily penalizing false negatives
     if 'optimized' in strategies and len(np.unique(labels)) > 1:
-        from sklearn.metrics import f1_score
-        # Try different thresholds and find the one with best F1-score
-        best_f1 = 0
-        best_threshold = np.percentile(reconstruction_errors, 95)  # default fallback
+        from sklearn.metrics import f1_score, recall_score
+        # Try different thresholds and find the one with best weighted F1-score (favoring recall)
+        # Weight recall 999x more than F1 to maximally penalize false negatives
+        best_score = 0
+        best_threshold = np.percentile(reconstruction_errors, 40)  # default fallback (maximally lower for sensitivity)
 
-        # Try thresholds from 90th to 99.9th percentile
+        # Try thresholds from 30th to 99.9th percentile (maximally extended lower range for maximum recall)
+        for percentile in np.arange(30, 99.9, 0.1):
+            threshold = np.percentile(reconstruction_errors, percentile)
+            predictions = (reconstruction_errors > threshold).astype(int)
+            f1 = f1_score(labels, predictions, zero_division=0)
+            recall = recall_score(labels, predictions, zero_division=0)
+            # Maximally weight recall to achieve highest possible false negative reduction
+            weighted_score = 0.001 * f1 + 0.999 * recall  # 999:1 weighting favoring recall
+            if weighted_score > best_score:
+                best_score = weighted_score
+                best_threshold = threshold
+
+        thresholds['optimized_recall_weighted'] = best_threshold
+        print(f"Optimized threshold (weighted recall score={best_score:.3f}): {best_threshold:.6f}")
+
+    # Optimized threshold based on weighted F1-score heavily penalizing false positives
+    if 'precision_optimized' in strategies and len(np.unique(labels)) > 1:
+        from sklearn.metrics import f1_score, precision_score
+        # Try different thresholds and find the one with best weighted F1-score (favoring precision)
+        # Weight precision 9x more than recall to extremely heavily penalize false positives
+        best_score = 0
+        best_threshold = np.percentile(reconstruction_errors, 95)  # default fallback (higher for precision)
+
+        # Try thresholds from 90th to 99.9th percentile (higher range for precision)
         for percentile in np.arange(90, 99.9, 0.1):
             threshold = np.percentile(reconstruction_errors, percentile)
             predictions = (reconstruction_errors > threshold).astype(int)
             f1 = f1_score(labels, predictions, zero_division=0)
-            if f1 > best_f1:
-                best_f1 = f1
+            precision = precision_score(labels, predictions, zero_division=0)
+            # Extremely heavily weight precision to penalize false positives
+            weighted_score = 0.9 * precision + 0.1 * f1  # 9:1 weighting favoring precision
+            if weighted_score > best_score:
+                best_score = weighted_score
                 best_threshold = threshold
 
-        thresholds['optimized_f1'] = best_threshold
-        print(f"Optimized threshold (F1={best_f1:.3f}): {best_threshold:.6f}")
+        thresholds['optimized_precision_weighted'] = best_threshold
+        print(f"Optimized threshold (weighted precision score={best_score:.3f}): {best_threshold:.6f}")
 
     print("🎯 Determined anomaly thresholds:")
     for strategy, threshold in thresholds.items():
-        print(".6f")
+        print(f"   {strategy}: {threshold:.6f}")
 
     return thresholds
 
@@ -395,6 +431,16 @@ def evaluate_dae_model(checkpoint_path='checkpoints/dae_sonar_best.pth', device=
     print("🚢 EVALUATING DAE MODEL FOR SONAR ANOMALY DETECTION")
     print("="*60)
 
+    # Setup local logging for this evaluation function
+    os.makedirs('results/logs', exist_ok=True)
+    logging.basicConfig(
+        filename='results/logs/evaluation_dae.log',
+        level=logging.INFO,
+        format='%(asctime)s - EVAL_DAE - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger('EVAL_DAE')
+
     try:
         # Load model
         model = load_trained_model(checkpoint_path, 'dae', device)
@@ -416,7 +462,7 @@ def evaluate_dae_model(checkpoint_path='checkpoints/dae_sonar_best.pth', device=
         )
 
         # Determine thresholds
-        thresholds = determine_anomaly_thresholds(errors, labels, strategies=['percentile', 'statistical', 'optimized'])
+        thresholds = determine_anomaly_thresholds(errors, labels, strategies=['percentile', 'statistical', 'optimized', 'precision_optimized'])
 
         # Evaluate anomaly detection
         evaluation_results = evaluate_anomaly_detection(errors, labels, thresholds)
@@ -433,9 +479,11 @@ def evaluate_dae_model(checkpoint_path='checkpoints/dae_sonar_best.pth', device=
         save_evaluation_results_to_csv(best_results, 'DAE', 'SONAR', latencies)
 
         print("✅ DAE evaluation completed successfully")
+        logger.info("DAE evaluation completed successfully")
 
     except Exception as e:
         print(f"❌ DAE evaluation failed: {str(e)}")
+        logger.error(f"DAE evaluation failed: {str(e)}")
         raise
 
 def evaluate_vae_model(checkpoint_path='checkpoints/vae_ims_best.pth', device='cpu'):
@@ -451,6 +499,16 @@ def evaluate_vae_model(checkpoint_path='checkpoints/vae_ims_best.pth', device='c
     """
     print("✈️ EVALUATING VAE MODEL FOR IMS BEARING ANOMALY DETECTION")
     print("="*60)
+
+    # Setup local logging for this evaluation function
+    os.makedirs('results/logs', exist_ok=True)
+    logging.basicConfig(
+        filename='results/logs/evaluation_vae.log',
+        level=logging.INFO,
+        format='%(asctime)s - EVAL_VAE - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger('EVAL_VAE')
 
     try:
         # Load model
@@ -495,7 +553,7 @@ def evaluate_vae_model(checkpoint_path='checkpoints/vae_ims_best.pth', device='c
         labels = y_ims_val_np[:n_samples]  # Take only the first n_samples labels
 
         # Determine thresholds
-        thresholds = determine_anomaly_thresholds(errors, labels, strategies=['percentile', 'statistical', 'optimized'])
+        thresholds = determine_anomaly_thresholds(errors, labels, strategies=['percentile', 'statistical', 'optimized', 'precision_optimized'])
 
         # Evaluate anomaly detection
         evaluation_results = evaluate_anomaly_detection(errors, labels, thresholds)
@@ -512,9 +570,11 @@ def evaluate_vae_model(checkpoint_path='checkpoints/vae_ims_best.pth', device='c
         save_evaluation_results_to_csv(best_results, 'VAE', 'IMS', latencies)
 
         print("✅ VAE evaluation completed successfully")
+        logger.info("VAE evaluation completed successfully")
 
     except Exception as e:
         print(f"❌ VAE evaluation failed: {str(e)}")
+        logger.error(f"VAE evaluation failed: {str(e)}")
         raise
 
 def main():
@@ -607,7 +667,7 @@ def save_evaluation_results_to_csv(evaluation_results, model_type, dataset_name,
         existing_df = pd.read_csv(filename)
         df = pd.concat([existing_df, df], ignore_index=True)
     df.to_csv(filename, index=False)
-    print(f"💾 Evaluation results saved to {filename} (latency: {results['Average_Latency_ms']:.3f} ms)")
+    print(f"💾 Evaluation results saved to {filename} (latency: {results['Average_Latency_ms'] or 'N/A'} ms)")
 
     # Final summary
     print("\n🎯 EVALUATION COMPLETED")

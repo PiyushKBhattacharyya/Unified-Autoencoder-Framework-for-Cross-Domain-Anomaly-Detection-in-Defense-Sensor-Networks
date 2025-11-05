@@ -1,2 +1,2 @@
 model_type,best_score,learning_rate,batch_size,epochs
-DAE,0.11354931,1e-06,12,500
+DAE,0.114648804,1e-06,8,400
