@@ -1,0 +1,2 @@
+Dataset,Model,Total_Training_Time_s,Epochs_Trained,Batch_Size,Learning_Rate,Random_Seed,Device,Final_Train_Loss,Final_Val_Loss,Precision,Recall,F1_Score,Accuracy
+SONAR,DAE,15.34,500,16,0.001,123,cpu,0.02403547428548336,0.028762303292751312,0.7419354838709677,0.4144144144144144,0.5317919075144508,0.6105769230769231

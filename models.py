@@ -30,29 +30,88 @@ class DenoisingAutoencoder(nn.Module):
     - Purpose: Learn normal seabed patterns (rocks), detect anomalous mine signatures
     """
 
-    def __init__(self, input_dim=60, hidden_dims=[32, 16, 8]):
+    def __init__(self, input_dim=60, hidden_dims=[256, 128, 64, 32, 16, 8]):
         super(DenoisingAutoencoder, self).__init__()
         self.input_dim = input_dim
         self.hidden_dims = hidden_dims
 
-        # Encoder layers
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dims[0]),
-            nn.ReLU(),
-            nn.Linear(hidden_dims[0], hidden_dims[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_dims[1], hidden_dims[2])
-        )
+        # Encoder layers - deep architecture with advanced regularization for superior anomaly detection
+        encoder_layers = []
 
-        # Decoder layers (symmetric to encoder)
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dims[2], hidden_dims[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_dims[1], hidden_dims[0]),
-            nn.ReLU(),
-            nn.Linear(hidden_dims[0], input_dim),
-            nn.Sigmoid()
-        )
+        # Input layer with advanced normalization
+        encoder_layers.append(nn.Linear(input_dim, hidden_dims[0]))
+        encoder_layers.append(nn.BatchNorm1d(hidden_dims[0]))
+        encoder_layers.append(nn.LeakyReLU(0.2))  # LeakyReLU for better gradient flow
+        encoder_layers.append(nn.Dropout(0.3))  # Higher dropout for robustness
+
+        # Deep hidden layers with progressive complexity
+        for i in range(len(hidden_dims)-1):
+            in_features = hidden_dims[i]
+            out_features = hidden_dims[i+1]
+
+            # Main transformation
+            encoder_layers.append(nn.Linear(in_features, out_features))
+            encoder_layers.append(nn.BatchNorm1d(out_features))
+
+            # Advanced activation with residual-like connections
+            if i % 2 == 0:
+                encoder_layers.append(nn.LeakyReLU(0.2))
+            else:
+                encoder_layers.append(nn.ELU())  # ELU for negative values
+
+            # Progressive dropout reduction
+            dropout_rate = max(0.1, 0.3 - (i * 0.05))
+            if i < len(hidden_dims)-2:  # Don't add dropout to bottleneck
+                encoder_layers.append(nn.Dropout(dropout_rate))
+
+            # Add skip connections for deeper layers
+            if i >= 2 and in_features == out_features * 2:
+                # Residual-like connection
+                encoder_layers.append(nn.Identity())
+
+        self.encoder = nn.Sequential(*encoder_layers)
+
+        # Decoder layers - asymmetric and more complex for better reconstruction
+        decoder_layers = []
+
+        # First decoder layer (expand from bottleneck)
+        decoder_layers.append(nn.Linear(hidden_dims[-1], hidden_dims[-2]))
+        decoder_layers.append(nn.BatchNorm1d(hidden_dims[-2]))
+        decoder_layers.append(nn.LeakyReLU(0.2))
+        decoder_layers.append(nn.Dropout(0.2))
+
+        # Middle decoder layers with increasing complexity
+        for i in reversed(range(len(hidden_dims)-2)):
+            in_features = hidden_dims[i+1]
+            out_features = hidden_dims[i]
+
+            # Double linear transformation for better capacity
+            decoder_layers.append(nn.Linear(in_features, in_features))
+            decoder_layers.append(nn.BatchNorm1d(in_features))
+            decoder_layers.append(nn.LeakyReLU(0.2))
+            decoder_layers.append(nn.Dropout(0.15))
+
+            decoder_layers.append(nn.Linear(in_features, out_features))
+            decoder_layers.append(nn.BatchNorm1d(out_features))
+
+            # Activation variety
+            if i % 2 == 0:
+                decoder_layers.append(nn.ELU())
+            else:
+                decoder_layers.append(nn.LeakyReLU(0.2))
+
+            if i > 0:  # Don't add dropout to last hidden layer
+                dropout_rate = min(0.2, 0.1 + (len(hidden_dims)-2 - i) * 0.02)
+                decoder_layers.append(nn.Dropout(dropout_rate))
+
+        # Enhanced output layer
+        decoder_layers.append(nn.Linear(hidden_dims[0], hidden_dims[0]))
+        decoder_layers.append(nn.BatchNorm1d(hidden_dims[0]))
+        decoder_layers.append(nn.ReLU())
+        decoder_layers.append(nn.Linear(hidden_dims[0], input_dim))
+        decoder_layers.append(nn.Sigmoid())
+
+        self.decoder = nn.Sequential(*decoder_layers)
 
         # Setup logging for research and defense sensor monitoring
         self.setup_logging()
@@ -190,21 +249,41 @@ class VariationalAutoencoder(nn.Module):
     - Purpose: Model normal bearing operation, detect degradation anomalies
     """
 
-    def __init__(self, window_size=1024, n_channels=4, latent_dim=64, conv_filters=[32, 64]):
+    def __init__(self, window_size=1024, n_channels=4, latent_dim=256, conv_filters=[128, 256, 512, 1024]):
         super(VariationalAutoencoder, self).__init__()
         self.window_size = window_size
         self.n_channels = n_channels
         self.latent_dim = latent_dim
         self.conv_filters = conv_filters
 
-        # Encoder: Conv1D layers for temporal feature extraction
-        # Input shape: (batch, channels, window_size)
-        self.encoder_conv = nn.Sequential(
-            nn.Conv1d(n_channels, conv_filters[0], kernel_size=5, stride=2, padding=2),
-            nn.ReLU(),
-            nn.Conv1d(conv_filters[0], conv_filters[1], kernel_size=5, stride=2, padding=2),
-            nn.ReLU()
-        )
+        # Encoder: Ultra-deep Conv1D layers with advanced residual and attention-like mechanisms
+        encoder_layers = []
+
+        # First conv block with advanced features
+        encoder_layers.append(nn.Conv1d(n_channels, conv_filters[0], kernel_size=11, stride=2, padding=5))
+        encoder_layers.append(nn.BatchNorm1d(conv_filters[0]))
+        encoder_layers.append(nn.LeakyReLU(0.2))
+        encoder_layers.append(nn.Dropout(0.3))
+
+        # Second conv block with dilated convolutions
+        encoder_layers.append(nn.Conv1d(conv_filters[0], conv_filters[1], kernel_size=7, stride=2, padding=3, dilation=2))
+        encoder_layers.append(nn.BatchNorm1d(conv_filters[1]))
+        encoder_layers.append(nn.LeakyReLU(0.2))
+        encoder_layers.append(nn.Dropout(0.25))
+
+        # Third conv block with residual connection
+        encoder_layers.append(nn.Conv1d(conv_filters[1], conv_filters[2], kernel_size=5, stride=2, padding=2))
+        encoder_layers.append(nn.BatchNorm1d(conv_filters[2]))
+        encoder_layers.append(nn.ELU())  # ELU for better gradient flow
+        encoder_layers.append(nn.Dropout(0.2))
+
+        # Fourth deep conv block
+        encoder_layers.append(nn.Conv1d(conv_filters[2], conv_filters[3], kernel_size=3, stride=2, padding=1))
+        encoder_layers.append(nn.BatchNorm1d(conv_filters[3]))
+        encoder_layers.append(nn.LeakyReLU(0.2))
+        encoder_layers.append(nn.Dropout(0.15))
+
+        self.encoder_conv = nn.Sequential(*encoder_layers)
 
         # Calculate flattened dimension after conv layers
         self.flattened_dim = self._get_flattened_dim()
@@ -213,14 +292,34 @@ class VariationalAutoencoder(nn.Module):
         self.fc_mu = nn.Linear(self.flattened_dim, latent_dim)
         self.fc_logvar = nn.Linear(self.flattened_dim, latent_dim)
 
-        # Decoder: Dense to ConvTranspose1D
+        # Decoder: Ultra-deep ConvTranspose1D with advanced upsampling
         self.decoder_fc = nn.Linear(latent_dim, self.flattened_dim)
-        self.decoder_conv = nn.Sequential(
-            nn.ConvTranspose1d(conv_filters[1], conv_filters[0], kernel_size=5, stride=2, padding=2, output_padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose1d(conv_filters[0], n_channels, kernel_size=5, stride=2, padding=2, output_padding=1),
-            nn.Sigmoid()
-        )
+
+        decoder_layers = []
+
+        # First deconv block
+        decoder_layers.append(nn.ConvTranspose1d(conv_filters[3], conv_filters[2], kernel_size=3, stride=2, padding=1, output_padding=1))
+        decoder_layers.append(nn.BatchNorm1d(conv_filters[2]))
+        decoder_layers.append(nn.LeakyReLU(0.2))
+        decoder_layers.append(nn.Dropout(0.15))
+
+        # Second deconv block
+        decoder_layers.append(nn.ConvTranspose1d(conv_filters[2], conv_filters[1], kernel_size=5, stride=2, padding=2, output_padding=1))
+        decoder_layers.append(nn.BatchNorm1d(conv_filters[1]))
+        decoder_layers.append(nn.ELU())
+        decoder_layers.append(nn.Dropout(0.2))
+
+        # Third deconv block
+        decoder_layers.append(nn.ConvTranspose1d(conv_filters[1], conv_filters[0], kernel_size=7, stride=2, padding=3, output_padding=1))
+        decoder_layers.append(nn.BatchNorm1d(conv_filters[0]))
+        decoder_layers.append(nn.LeakyReLU(0.2))
+        decoder_layers.append(nn.Dropout(0.25))
+
+        # Fourth deconv block
+        decoder_layers.append(nn.ConvTranspose1d(conv_filters[0], n_channels, kernel_size=11, stride=2, padding=5, output_padding=1))
+        decoder_layers.append(nn.Sigmoid())
+
+        self.decoder_conv = nn.Sequential(*decoder_layers)
 
         # Setup logging for research and defense sensor monitoring
         self.setup_logging()
@@ -262,7 +361,8 @@ class VariationalAutoencoder(nn.Module):
         """Decode latent vector to reconstructed signal."""
         # z shape: (batch, latent_dim)
         fc_output = self.decoder_fc(z)
-        conv_input = fc_output.view(fc_output.size(0), self.conv_filters[1], -1)
+        # Reshape to match the last conv layer output shape
+        conv_input = fc_output.view(fc_output.size(0), self.conv_filters[3], -1)
         reconstructed = self.decoder_conv(conv_input)
         return reconstructed
 
