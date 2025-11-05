@@ -230,7 +230,7 @@ def train_dae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
         if len(np.unique(val_labels)) > 1:
             val_auc = roc_auc_score(val_labels, val_errors)
         else:
-            val_auc = np.nan
+            val_auc = 0.5  # Default for single class (no discriminative power)
 
         val_aucs.append(val_auc)
         val_f1s.append(val_f1)
@@ -419,7 +419,7 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
         if len(np.unique(train_labels)) > 1:
             train_auc = roc_auc_score(train_labels, train_errors)
         else:
-            train_auc = np.nan
+            train_auc = 0.5  # Default for single class (no discriminative power)
 
         train_aucs.append(train_auc)
         train_f1s.append(train_f1)
@@ -493,7 +493,7 @@ def train_vae(model, train_loader, val_loader, device, epochs=100, lr=1e-3, pati
         if len(np.unique(val_labels)) > 1:
             val_auc = roc_auc_score(val_labels, val_errors)
         else:
-            val_auc = np.nan
+            val_auc = 0.5  # Default for single class (no discriminative power)
 
         val_aucs.append(val_auc)
         val_f1s.append(val_f1)

@@ -7,6 +7,7 @@ from datetime import datetime
 import time
 from tabulate import tabulate
 import pandas as pd
+from itertools import product
 
 # Import custom modules for defense sensor anomaly detection
 from data_loader import load_sonar_data, load_ims_data, set_random_seed
@@ -110,7 +111,222 @@ class DefenseAnomalyDetector:
         self.logger.info(f"Created {model_type} model for {dataset_type} anomaly detection")
         return model, model_type
 
-    def train_model(self, model, X_train, X_val, y_train, y_val, model_type):
+    def perform_grid_search(self, X_train, X_val, y_train, y_val, model_type):
+        """
+        Perform grid search over hyperparameters to find optimal configuration.
+
+        Parameters:
+        X_train, X_val, y_train, y_val: Training and validation data
+        model_type: 'DAE' or 'VAE'
+
+        Returns:
+        dict: Best hyperparameters and their validation metrics
+        """
+        self.logger.info(f"Starting grid search for {model_type} hyperparameters")
+
+        # Define hyperparameter grids
+        if model_type == 'DAE':
+            param_grid = {
+                'learning_rate': [1e-4, 5e-4, 1e-3, 5e-3],
+                'batch_size': [16, 32, 64],
+                'epochs': [50, 100, 150]  # Will be used as max_epochs for early stopping
+            }
+        else:  # VAE
+            param_grid = {
+                'learning_rate': [1e-4, 5e-4, 1e-3],
+                'batch_size': [16, 32, 64],
+                'epochs': [50, 100, 150]
+            }
+
+        # Generate all combinations
+        param_combinations = list(product(*param_grid.values()))
+        param_names = list(param_grid.keys())
+
+        best_score = float('-inf') if model_type == 'DAE' else float('inf')
+        best_params = None
+        best_metrics = None
+
+        results = []
+
+        print(f"\n🔍 Performing Grid Search for {model_type}")
+        print(f"Testing {len(param_combinations)} hyperparameter combinations")
+
+        for i, params in enumerate(param_combinations):
+            param_dict = dict(zip(param_names, params))
+            print(f"\nCombination {i+1}/{len(param_combinations)}: {param_dict}")
+
+            # Create fresh model for each combination
+            if model_type == 'DAE':
+                model = create_dae_sonar()
+            else:
+                model = create_vae_ims()
+
+            # Train with current hyperparameters
+            try:
+                trained_model, losses_dict, final_metrics = self.train_model_with_params(
+                    model, X_train, X_val, y_train, y_val, model_type, param_dict
+                )
+
+                # Evaluate performance
+                score = self.evaluate_hyperparams(trained_model, X_val, y_val, model_type, losses_dict)
+
+                # Track results
+                result = {
+                    'combination': i+1,
+                    **param_dict,
+                    'val_score': score,
+                    'final_val_loss': losses_dict['val'][-1] if model_type == 'DAE' else losses_dict['val_total'][-1]
+                }
+                results.append(result)
+
+                # Update best parameters
+                is_better = (model_type == 'DAE' and score > best_score) or (model_type == 'VAE' and score < best_score)
+                if is_better or best_params is None:
+                    best_score = score
+                    best_params = param_dict.copy()
+                    best_metrics = {
+                        'score': score,
+                        'losses_dict': losses_dict,
+                        'final_metrics': final_metrics
+                    }
+
+                print(f"   Score: {score:.4f}")
+
+            except Exception as e:
+                self.logger.error(f"Failed combination {param_dict}: {str(e)}")
+                print(f"   ❌ Failed: {str(e)}")
+                continue
+
+        # Save grid search results
+        self.save_grid_search_results(results, model_type, best_params, best_score)
+
+        self.logger.info(f"Grid search completed. Best {model_type} params: {best_params}, Score: {best_score:.4f}")
+        print(f"\n🏆 Best {model_type} hyperparameters: {best_params}")
+        print(f"   Best validation score: {best_score:.4f}")
+
+        return best_params, best_metrics
+
+    def train_model_with_params(self, model, X_train, X_val, y_train, y_val, model_type, params):
+        """
+        Train model with specific hyperparameters (used for grid search).
+        """
+        # Create data loaders with current batch size
+        from torch.utils.data import TensorDataset, DataLoader
+        batch_size = params['batch_size']
+
+        if model_type == 'DAE':
+            train_dataset = TensorDataset(X_train, y_train)
+            val_dataset = TensorDataset(X_val, y_val)
+        else:
+            # IMS data: time-series windows - transpose for Conv1D
+            X_train_proc = X_train.permute(0, 2, 1)
+            X_val_proc = X_val.permute(0, 2, 1)
+            train_dataset = TensorDataset(X_train_proc, y_train)
+            val_dataset = TensorDataset(X_val_proc, y_val)
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                                num_workers=0, pin_memory=False)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                               num_workers=0, pin_memory=False)
+
+        # Train with current hyperparameters
+        start_time = time.time()
+
+        if model_type == 'DAE':
+            trained_model, train_losses, val_losses, train_aucs, val_aucs, train_f1s, val_f1s, train_precisions, val_precisions, train_recalls, val_recalls, train_accuracies, val_accuracies = train_dae(
+                model, train_loader, val_loader, self.device,
+                epochs=params['epochs'], lr=params['learning_rate'], patience=20  # Reduced patience for grid search
+            )
+            losses_dict = {'train': train_losses, 'val': val_losses}
+            final_metrics = {
+                'train_precision': train_precisions[-1] if train_precisions else None,
+                'val_precision': val_precisions[-1] if val_precisions else None,
+                'train_recall': train_recalls[-1] if train_recalls else None,
+                'val_recall': val_recalls[-1] if val_recalls else None,
+                'train_accuracy': train_accuracies[-1] if train_accuracies else None,
+                'val_accuracy': val_accuracies[-1] if val_accuracies else None
+            }
+        else:
+            trained_model, train_total, train_mse, train_kl, val_total, val_mse, val_kl, *metrics = train_vae(
+                model, train_loader, val_loader, self.device,
+                epochs=params['epochs'], lr=params['learning_rate'], patience=20
+            )
+            losses_dict = {'train_total': train_total, 'train_mse': train_mse, 'train_kl': train_kl,
+                          'val_total': val_total, 'val_mse': val_mse, 'val_kl': val_kl}
+            final_metrics = None
+
+        training_time = time.time() - start_time
+        print(f"   Training completed in {training_time:.1f}s")
+
+        return trained_model, losses_dict, final_metrics
+
+    def evaluate_hyperparams(self, model, X_val, y_val, model_type, losses_dict):
+        """
+        Evaluate hyperparameter combination performance.
+
+        Returns validation F1 score for DAE, negative validation loss for VAE.
+        """
+        model.eval()
+
+        # Create validation data loader
+        from torch.utils.data import TensorDataset, DataLoader
+        if model_type == 'VAE':
+            X_val = X_val.permute(0, 2, 1)
+
+        val_dataset = TensorDataset(X_val, y_val)
+        val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+        errors = []
+        labels_list = []
+
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs = inputs.to(self.device)
+                labels_list.extend(labels.cpu().numpy())
+
+                if model_type == 'DAE':
+                    reconstructed, _ = model(inputs)
+                    per_sample_errors = torch.mean((reconstructed - inputs) ** 2, dim=1).cpu().numpy()
+                else:
+                    reconstructed, _, _ = model(inputs)
+                    per_sample_errors = torch.mean((reconstructed - inputs) ** 2, dim=[1, 2]).cpu().numpy()
+
+                errors.extend(per_sample_errors)
+
+        errors = np.array(errors)
+        labels = np.array(labels_list)
+
+        # Use 95th percentile as threshold
+        threshold = np.percentile(errors, 95)
+        predictions = (errors > threshold).astype(int)
+
+        if model_type == 'DAE':
+            # Return F1 score (higher is better)
+            from sklearn.metrics import f1_score
+            score = f1_score(labels, predictions, zero_division=0)
+        else:
+            # For VAE, return negative validation loss (higher is better)
+            score = -losses_dict['val_total'][-1]
+
+        return score
+
+    def save_grid_search_results(self, results, model_type, best_params, best_score):
+        """Save grid search results to CSV."""
+        os.makedirs('results/grid_search', exist_ok=True)
+
+        df = pd.DataFrame(results)
+        filename = f"results/grid_search/{model_type.lower()}_grid_search_results.csv"
+        df.to_csv(filename, index=False)
+
+        # Save best parameters
+        best_params_df = pd.DataFrame([{'model_type': model_type, 'best_score': best_score, **best_params}])
+        best_filename = f"results/grid_search/{model_type.lower()}_best_params.csv"
+        best_params_df.to_csv(best_filename, index=False)
+
+        print(f"💾 Grid search results saved to {filename}")
+        print(f"💾 Best parameters saved to {best_filename}")
+
+    def train_model(self, model, X_train, X_val, y_train, y_val, model_type, patience=50):
         """
         Train the autoencoder model with optimized defense sensor training parameters.
 
@@ -146,7 +362,7 @@ class DefenseAnomalyDetector:
         if model_type == 'DAE':
             trained_model, train_losses, val_losses, train_aucs, val_aucs, train_f1s, val_f1s, train_precisions, val_precisions, train_recalls, val_recalls, train_accuracies, val_accuracies = train_dae(
                 model, train_loader, val_loader, self.device,
-                epochs=self.config['epochs'], lr=self.config['learning_rate'], patience=15
+                epochs=self.config['epochs'], lr=self.config['learning_rate'], patience=patience
             )
             losses_dict = {'train': train_losses, 'val': val_losses}
             aucs = (train_aucs, val_aucs)
@@ -166,7 +382,7 @@ class DefenseAnomalyDetector:
         else:
             trained_model, train_total, train_mse, train_kl, val_total, val_mse, val_kl, *metrics = train_vae(
                 model, train_loader, val_loader, self.device,
-                epochs=self.config['epochs'], lr=self.config['learning_rate'], patience=15
+                epochs=self.config['epochs'], lr=self.config['learning_rate'], patience=patience
             )
             losses_dict = {'train_total': train_total, 'train_mse': train_mse, 'train_kl': train_kl,
                           'val_total': val_total, 'val_mse': val_mse, 'val_kl': val_kl}
@@ -220,59 +436,278 @@ class DefenseAnomalyDetector:
         print(f"Epochs: {self.config['epochs']}")
         print(f"Batch Size: {self.config['batch_size']}")
         print(f"Learning Rate: {self.config['learning_rate']}")
+        print(f"Early Stopping Patience: 50")
+        print(f"Grid Search: {'Enabled' if self.config.get('grid_search', False) else 'Disabled'}")
         print("=" * 70)
 
-        start_time = time.time()
+        self.start_time = time.time()
 
         try:
+            # Initialize start_time for error handling
+            pass
             # Phase 1: Data Loading and Preparation
             print("\n📊 PHASE 1: DATA LOADING AND PREPARATION")
             X_data, y_data, dataset_type = self.load_and_prepare_data(self.config['dataset'])
 
-            # Create validation split for robust evaluation
+            # For anomaly detection, train only on normal samples (label 0)
+            normal_indices = np.where(y_data == 0)[0]
+            anomaly_indices = np.where(y_data == 1)[0]
+
+            print(f"📊 Dataset: {len(normal_indices)} normal, {len(anomaly_indices)} anomalous samples")
+
+            # Create validation split from normal samples only for training
             from train import create_validation_split
-            X_train, X_val, y_train, y_val = create_validation_split(
-                X_data, y_data, val_split=0.1, seed=self.config['seed']
+            X_normal = X_data[normal_indices]
+            y_normal = y_data[normal_indices]
+
+            X_train, X_val_normal, y_train, y_val_normal = create_validation_split(
+                X_normal, y_normal, val_split=0.1, seed=self.config['seed']
             )
+
+            # For evaluation, use all data (normal + anomalous)
+            X_full = X_data
+            y_full = y_data
 
             # Convert to tensors
             X_train = torch.FloatTensor(X_train)
-            X_val = torch.FloatTensor(X_val)
+            X_val_normal = torch.FloatTensor(X_val_normal)
             y_train = torch.LongTensor(y_train)
-            y_val = torch.LongTensor(y_val)
+            y_val_normal = torch.LongTensor(y_val_normal)
+
+            # Full dataset for evaluation
+            X_full = torch.FloatTensor(X_full)
+            y_full = torch.LongTensor(y_full)
 
             # Phase 2: Model Creation and Training
             model_name = "DAE" if dataset_type == 'sonar' else "VAE"
             dataset_name = "Sonar" if dataset_type == 'sonar' else "IMS"
-            print(f"\n🤖 PHASE 2: TRAINING {model_name} FOR {dataset_name.upper()} ANOMALY DETECTION")
-            model, model_type = self.create_model(dataset_type)
-            trained_model, losses_dict, final_train_metrics = self.train_model(
-                model, X_train, X_val, y_train, y_val, model_type
-            )
+            print(f"\n🤖 PHASE 2: TRAINING {model_name} FOR {dataset_name.upper()} ANOMALY DETECTION (Normal Samples Only)")
+
+            # Perform grid search if enabled
+            if self.config.get('grid_search', False):
+                print(f"\n🔍 PHASE 2.1: GRID SEARCH HYPERPARAMETER TUNING FOR {model_name}")
+                best_params, best_metrics = self.perform_grid_search(
+                    X_train, X_val_normal, y_train, y_val_normal, model_name
+                )
+
+                # Update config with best parameters
+                self.config.update(best_params)
+                print(f"✅ Using best hyperparameters: {best_params}")
+
+                # Create and train final model with best parameters
+                model, model_type = self.create_model(dataset_type)
+                trained_model, losses_dict, final_train_metrics = self.train_model(
+                    model, X_train, X_val_normal, y_train, y_val_normal, model_type, patience=50
+                )
+            else:
+                # Train with default/configured parameters
+                model, model_type = self.create_model(dataset_type)
+                trained_model, losses_dict, final_train_metrics = self.train_model(
+                    model, X_train, X_val_normal, y_train, y_val_normal, model_type, patience=50
+                )
 
             # Phase 3: Evaluation and Visualization
-            print("\n📈 PHASE 3: EVALUATION AND VISUALIZATION")
-            self.evaluate_and_visualize(dataset_type)
-
-            # Phase 4: Results Summary
-            total_time = time.time() - start_time
-            self.generate_results_summary(dataset_type, model_type, total_time, final_train_metrics if model_type == 'DAE' else None)
-
-            # Save final results to CSV
-            self.save_results_summary(dataset_type, model_type, total_time, losses_dict, final_train_metrics)
-
-            print("\n✅ DEFENSE ANOMALY DETECTION PIPELINE COMPLETED SUCCESSFULLY")
-            print("=" * 70)
-            print("🛡️ Ready for operational deployment in defense sensor networks")
-
-            self.logger.info("Defense anomaly detection pipeline completed successfully")
+            print("\n📈 PHASE 3: EVALUATION AND VISUALIZATION (Full Dataset)")
+            self.evaluate_and_visualize_anomaly_detection(trained_model, X_full, y_full, model_type, dataset_type, losses_dict, final_train_metrics)
 
         except Exception as e:
             self.logger.error(f"Pipeline failed: {str(e)}")
             print(f"❌ Pipeline failed: {str(e)}")
             raise
 
-    def generate_results_summary(self, dataset_type, model_type, total_time, final_train_metrics=None):
+    def evaluate_and_visualize_anomaly_detection(self, trained_model, X_full, y_full, model_type, dataset_type, losses_dict, final_train_metrics):
+        """
+        Evaluate anomaly detection performance on the full dataset (normal + anomalous).
+
+        Parameters:
+        trained_model: Trained autoencoder model
+        X_full: Full dataset features
+        y_full: Full dataset labels
+        model_type: 'DAE' or 'VAE'
+        dataset_type: 'sonar' or 'ims'
+        """
+        print(f"🔍 Evaluating {model_type} anomaly detection on full dataset...")
+
+        # Create data loader for full dataset
+        from torch.utils.data import TensorDataset, DataLoader
+
+        if model_type == 'VAE':
+            # Transpose IMS data for Conv1D
+            X_full = X_full.permute(0, 2, 1)
+
+        full_dataset = TensorDataset(X_full, y_full)
+        full_loader = DataLoader(full_dataset, batch_size=64, shuffle=False)
+
+        # Compute reconstruction errors
+        trained_model.eval()
+        errors = []
+        labels_list = []
+
+        with torch.no_grad():
+            for inputs, labels in full_loader:
+                inputs = inputs.to(self.device)
+                labels_list.extend(labels.cpu().numpy())
+
+                if model_type == 'DAE':
+                    reconstructed, _ = trained_model(inputs)
+                    per_sample_errors = torch.mean((reconstructed - inputs) ** 2, dim=1).cpu().numpy()
+                else:  # VAE
+                    reconstructed, _, _ = trained_model(inputs)
+                    per_sample_errors = torch.mean((reconstructed - inputs) ** 2, dim=[1, 2]).cpu().numpy()
+
+                errors.extend(per_sample_errors)
+
+        errors = np.array(errors)
+        labels = np.array(labels_list)
+
+        # Find optimal threshold
+        from sklearn.metrics import f1_score, precision_score, recall_score
+
+        best_f1 = 0
+        best_threshold = np.percentile(errors, 95)  # default
+
+        # Search for best threshold
+        for percentile in np.arange(80, 99, 0.5):
+            threshold = np.percentile(errors, percentile)
+            predictions = (errors > threshold).astype(int)
+            f1 = f1_score(labels, predictions, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+
+        # Evaluate with best threshold
+        predictions = (errors > best_threshold).astype(int)
+
+        precision = precision_score(labels, predictions, zero_division=0)
+        recall = recall_score(labels, predictions, zero_division=0)
+        f1 = f1_score(labels, predictions, zero_division=0)
+        accuracy = np.mean(predictions == labels)
+
+        print(f"\n📊 {model_type} Anomaly Detection Results:")
+        print(f"   Optimal Threshold: {best_threshold:.6f}")
+        print(f"   Precision: {precision:.4f}")
+        print(f"   Recall: {recall:.4f}")
+        print(f"   F1 Score: {f1:.4f}")
+        print(f"   Accuracy: {accuracy:.4f}")
+
+        # Confusion matrix
+        from sklearn.metrics import confusion_matrix
+        cm = confusion_matrix(labels, predictions)
+        print(f"\n   Confusion Matrix:")
+        print(f"   Normal as Normal: {cm[0,0]}")
+        print(f"   Normal as Anomaly: {cm[0,1]}")
+        print(f"   Anomaly as Normal: {cm[1,0]}")
+        print(f"   Anomaly as Anomaly: {cm[1,1]}")
+
+        # Store anomaly detection results for CSV export
+        anomaly_results = {
+            'threshold': best_threshold,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'accuracy': accuracy
+        }
+
+        # Generate visualization
+        self.generate_anomaly_detection_visualization(errors, labels, best_threshold, model_type, dataset_type, losses_dict, final_train_metrics, anomaly_results)
+
+        return {
+            'threshold': best_threshold,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'accuracy': accuracy,
+            'confusion_matrix': cm
+        }
+
+    def generate_anomaly_detection_visualization(self, errors, labels, threshold, model_type, dataset_type, losses_dict, final_train_metrics, anomaly_results):
+        """
+        Generate visualization for anomaly detection results.
+        """
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        os.makedirs('results/evaluation', exist_ok=True)
+
+        # Reconstruction error distribution
+        plt.figure(figsize=(12, 8))
+
+        normal_errors = errors[labels == 0]
+        anomaly_errors = errors[labels == 1]
+
+        plt.subplot(2, 2, 1)
+        plt.hist(normal_errors, bins=50, alpha=0.7, color='blue', label='Normal', density=True)
+        plt.hist(anomaly_errors, bins=50, alpha=0.7, color='red', label='Anomaly', density=True)
+        plt.axvline(threshold, color='black', linestyle='--', linewidth=2, label=f'Threshold: {threshold:.4f}')
+        plt.xlabel('Reconstruction Error')
+        plt.ylabel('Density')
+        plt.title(f'{model_type} Reconstruction Error Distribution')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # ROC curve
+        plt.subplot(2, 2, 2)
+        from sklearn.metrics import roc_curve, auc
+        fpr, tpr, _ = roc_curve(labels, errors)
+        roc_auc = auc(fpr, tpr)
+
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.3f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'{model_type} ROC Curve')
+        plt.legend(loc="lower right")
+        plt.grid(True, alpha=0.3)
+
+        # Precision-Recall curve
+        plt.subplot(2, 2, 3)
+        from sklearn.metrics import precision_recall_curve, average_precision_score
+        precision_curve, recall_curve, _ = precision_recall_curve(labels, errors)
+        avg_precision = average_precision_score(labels, errors)
+
+        plt.plot(recall_curve, precision_curve, color='blue', lw=2,
+                label=f'PR curve (AP = {avg_precision:.3f})')
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title(f'{model_type} Precision-Recall Curve')
+        plt.legend(loc="lower left")
+        plt.grid(True, alpha=0.3)
+
+        # Confusion matrix
+        plt.subplot(2, 2, 4)
+        from sklearn.metrics import confusion_matrix
+        predictions = (errors > threshold).astype(int)
+        cm = confusion_matrix(labels, predictions)
+
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                   xticklabels=['Normal', 'Anomaly'],
+                   yticklabels=['Normal', 'Anomaly'])
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title(f'{model_type} Confusion Matrix\n(Threshold: {threshold:.4f})')
+
+        plt.tight_layout()
+        plt.savefig(f'results/evaluation/{model_type.lower()}_anomaly_detection_results.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+        print(f"📊 Anomaly detection visualization saved to results/evaluation/{model_type.lower()}_anomaly_detection_results.png")
+
+        # Phase 4: Results Summary
+        total_time = time.time() - self.start_time
+        self.generate_results_summary(dataset_type, model_type, total_time, final_train_metrics, losses_dict, anomaly_results)
+
+        # Save final results to CSV
+        self.save_results_summary(dataset_type, model_type, total_time, losses_dict, final_train_metrics, anomaly_results)
+
+        print("\n✅ DEFENSE ANOMALY DETECTION PIPELINE COMPLETED SUCCESSFULLY")
+        print("=" * 70)
+        print("🛡️ Ready for operational deployment in defense sensor networks")
+
+        self.logger.info("Defense anomaly detection pipeline completed successfully")
+
+    def generate_results_summary(self, dataset_type, model_type, total_time, final_train_metrics=None, losses_dict=None, anomaly_results=None):
         """
         Generate comprehensive results summary in tabular format.
 
@@ -328,14 +763,12 @@ class DefenseAnomalyDetector:
             ["Logs Available", "results/logs/"]
         ]
 
-        if final_train_metrics:
+        if anomaly_results:
             summary_data.extend([
-                ["Final Train Precision", f"{final_train_metrics['train_precision']:.4f}"],
-                ["Final Val Precision", f"{final_train_metrics['val_precision']:.4f}"],
-                ["Final Train Recall", f"{final_train_metrics['train_recall']:.4f}"],
-                ["Final Val Recall", f"{final_train_metrics['val_recall']:.4f}"],
-                ["Final Train Accuracy", f"{final_train_metrics['train_accuracy']:.4f}"],
-                ["Final Val Accuracy", f"{final_train_metrics['val_accuracy']:.4f}"]
+                ["Anomaly Detection Precision", f"{anomaly_results['precision']:.4f}"],
+                ["Anomaly Detection Recall", f"{anomaly_results['recall']:.4f}"],
+                ["Anomaly Detection F1 Score", f"{anomaly_results['f1']:.4f}"],
+                ["Anomaly Detection Accuracy", f"{anomaly_results['accuracy']:.4f}"]
             ])
 
         print("\n" + tabulate(summary_data, tablefmt="grid"))
@@ -381,9 +814,9 @@ class DefenseAnomalyDetector:
             lines = log_content.split('\n')
             for line in lines:
                 if 'AUROC:' in line and auroc == "N/A":
-                    auroc = line.split('AUROC:')[1].strip()
+                    auroc = float(line.split('AUROC:')[1].strip())
                 elif 'F1 Score:' in line and f1 == "N/A":
-                    f1 = line.split('F1 Score:')[1].strip()
+                    f1 = float(line.split('F1 Score:')[1].strip())
                 elif 'Average latency:' in line:
                     latency = line.split('Average latency:')[1].split('ms')[0].strip() + "ms"
 
@@ -406,7 +839,7 @@ class DefenseAnomalyDetector:
         print("✅ Reproducibility ensured with seeds")
         print("🛡️ SYSTEM READY FOR OPERATIONAL THREAT DETECTION")
 
-    def save_results_summary(self, dataset_type, model_type, total_time, losses_dict, final_train_metrics=None):
+    def save_results_summary(self, dataset_type, model_type, total_time, losses_dict, final_train_metrics=None, anomaly_results=None):
         """
         Save final results including loss and evaluation metrics to CSV file.
 
@@ -443,33 +876,14 @@ class DefenseAnomalyDetector:
             results['Final_Val_MSE_Loss'] = losses_dict['val_mse'][-1] if losses_dict['val_mse'] else None
             results['Final_Val_KL_Loss'] = losses_dict['val_kl'][-1] if losses_dict['val_kl'] else None
 
-        # Add final training metrics for DAE
-        if final_train_metrics and model_type == 'DAE':
-            results['Final_Train_Precision'] = final_train_metrics['train_precision']
-            results['Final_Val_Precision'] = final_train_metrics['val_precision']
-            results['Final_Train_Recall'] = final_train_metrics['train_recall']
-            results['Final_Val_Recall'] = final_train_metrics['val_recall']
-            results['Final_Train_Accuracy'] = final_train_metrics['train_accuracy']
-            results['Final_Val_Accuracy'] = final_train_metrics['val_accuracy']
+        # Add anomaly detection evaluation metrics (the key metrics for defense sensor performance)
+        if anomaly_results:
+            results['Precision'] = anomaly_results.get('precision')
+            results['Recall'] = anomaly_results.get('recall')
+            results['F1_Score'] = anomaly_results.get('f1')
+            results['Accuracy'] = anomaly_results.get('accuracy')
 
-        # Try to extract evaluation metrics from log files
-        eval_log_path = 'results/evaluation/evaluation.log'
-        if os.path.exists(eval_log_path):
-            try:
-                with open(eval_log_path, 'r') as f:
-                    log_content = f.read()
-
-                lines = log_content.split('\n')
-                for line in lines:
-                    if 'AUROC:' in line:
-                        results['AUROC'] = float(line.split('AUROC:')[1].strip())
-                    elif 'F1 Score:' in line:
-                        results['F1_Score'] = float(line.split('F1 Score:')[1].strip())
-                    elif 'Average latency:' in line:
-                        latency_str = line.split('Average latency:')[1].split('ms')[0].strip()
-                        results['Average_Latency_ms'] = float(latency_str)
-            except Exception as e:
-                self.logger.warning(f"Could not extract evaluation metrics from log: {e}")
+        # Evaluation metrics are already captured above from anomaly_results
 
         # Save to CSV
         filename = f"results/summary/{model_type.lower()}_results.csv"
@@ -501,10 +915,13 @@ Examples:
                        help='Batch size for training (optimized for GPU utilization)')
 
     parser.add_argument('--lr', type=float, default=1e-3,
-                       help='Learning rate for optimizer')
+                        help='Learning rate for optimizer')
 
     parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed for reproducibility')
+                        help='Random seed for reproducibility')
+
+    parser.add_argument('--grid_search', action='store_true',
+                        help='Enable grid search for hyperparameter tuning')
 
     return parser.parse_args()
 
@@ -519,7 +936,8 @@ def main():
         'epochs': args.epochs,
         'batch_size': args.batch_size,
         'learning_rate': args.lr,
-        'seed': args.seed
+        'seed': args.seed,
+        'grid_search': args.grid_search
     }
 
     # Initialize and run defense anomaly detector

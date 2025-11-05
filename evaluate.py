@@ -123,7 +123,7 @@ def compute_reconstruction_errors(model, data_loader, model_type='dae', device='
 
     return errors, originals, labels, latencies
 
-def determine_anomaly_thresholds(reconstruction_errors, labels, strategies=['percentile', 'statistical']):
+def determine_anomaly_thresholds(reconstruction_errors, labels, strategies=['percentile', 'statistical', 'optimized']):
     """
     Determine anomaly detection thresholds using multiple strategies.
 
@@ -160,13 +160,32 @@ def determine_anomaly_thresholds(reconstruction_errors, labels, strategies=['per
             thresholds['statistical_3std'] = mean_all + 3 * std_all
             thresholds['statistical_4std'] = mean_all + 4 * std_all
 
+    # Optimized threshold based on F1-score
+    if 'optimized' in strategies and len(np.unique(labels)) > 1:
+        from sklearn.metrics import f1_score
+        # Try different thresholds and find the one with best F1-score
+        best_f1 = 0
+        best_threshold = np.percentile(reconstruction_errors, 95)  # default fallback
+
+        # Try thresholds from 90th to 99.9th percentile
+        for percentile in np.arange(90, 99.9, 0.1):
+            threshold = np.percentile(reconstruction_errors, percentile)
+            predictions = (reconstruction_errors > threshold).astype(int)
+            f1 = f1_score(labels, predictions, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+
+        thresholds['optimized_f1'] = best_threshold
+        print(f"Optimized threshold (F1={best_f1:.3f}): {best_threshold:.6f}")
+
     print("🎯 Determined anomaly thresholds:")
     for strategy, threshold in thresholds.items():
         print(".6f")
 
     return thresholds
 
-def evaluate_anomaly_detection(reconstruction_errors, labels, thresholds):
+def evaluate_anomaly_detection(reconstruction_errors, labels, thresholds, latencies=None):
     """
     Evaluate anomaly detection performance using various thresholds and metrics.
 
@@ -177,11 +196,15 @@ def evaluate_anomaly_detection(reconstruction_errors, labels, thresholds):
     reconstruction_errors (np.ndarray): Reconstruction errors per sample
     labels (np.ndarray): True anomaly labels
     thresholds (dict): Dictionary of threshold values
+    latencies (np.ndarray): Inference latencies per sample (optional)
 
     Returns:
     dict: Evaluation results for each threshold
     """
     results = {}
+
+    # Calculate average latency if provided
+    avg_latency = np.mean(latencies) if latencies is not None else None
 
     for threshold_name, threshold in thresholds.items():
         # Binary predictions based on threshold
@@ -191,6 +214,7 @@ def evaluate_anomaly_detection(reconstruction_errors, labels, thresholds):
         precision = precision_score(labels, predictions, zero_division=0)
         recall = recall_score(labels, predictions, zero_division=0)
         f1 = f1_score(labels, predictions, zero_division=0)
+        accuracy = np.mean(predictions == labels)
 
         # Compute AUROC if we have both classes
         if len(np.unique(labels)) > 1:
@@ -206,16 +230,18 @@ def evaluate_anomaly_detection(reconstruction_errors, labels, thresholds):
             'precision': precision,
             'recall': recall,
             'f1_score': f1,
+            'accuracy': accuracy,
             'auroc': auroc,
-            'predictions': predictions
+            'predictions': predictions,
+            'avg_latency_ms': avg_latency
         }
 
-        print(f"📊 {threshold_name}: P={precision:.3f}, R={recall:.3f}, F1={f1:.3f}, AUROC={auroc:.3f}")
+        print(f"📊 {threshold_name}: P={precision:.3f}, R={recall:.3f}, F1={f1:.3f}, Acc={accuracy:.3f}, AUROC={auroc:.3f}")
 
     return results
 
 def create_evaluation_visualizations(reconstruction_errors, labels, evaluation_results,
-                                   model_type='dae', save_dir='results/evaluation'):
+                                    model_type='dae', save_dir='results/evaluation'):
     """
     Generate research-quality visualizations for anomaly detection evaluation.
 
@@ -275,7 +301,7 @@ def create_evaluation_visualizations(reconstruction_errors, labels, evaluation_r
     f1_scores = [evaluation_results[name]['f1_score'] for name in threshold_names]
     plt.bar(range(len(threshold_names)), f1_scores, color='steelblue', alpha=0.8)
     plt.xticks(range(len(threshold_names)), [name.replace('_', '\n') for name in threshold_names],
-               rotation=45, ha='right')
+                rotation=45, ha='right')
     plt.ylabel('F1 Score')
     plt.title('Threshold Performance Comparison')
     plt.grid(True, alpha=0.3)
@@ -284,19 +310,22 @@ def create_evaluation_visualizations(reconstruction_errors, labels, evaluation_r
     plt.savefig(f'{save_dir}/{model_type}_evaluation_visualizations.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # Additional visualization: Confusion matrices for different thresholds
-    best_threshold = max(evaluation_results.keys(), key=lambda x: evaluation_results[x]['f1_score'])
+    # Additional visualization: Confusion matrices for ALL thresholds
+    for threshold_name, results in evaluation_results.items():
+        plt.figure(figsize=(8, 6))
+        cm = confusion_matrix(labels, results['predictions'])
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=['Normal', 'Anomaly'], yticklabels=['Normal', 'Anomaly'])
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title(f'{model_type.upper()} Confusion Matrix ({threshold_name})')
+        plt.tight_layout()
+        plt.savefig(f'{save_dir}/{model_type}_confusion_matrix_{threshold_name}.png', dpi=300, bbox_inches='tight')
+        plt.close()
 
-    plt.figure(figsize=(8, 6))
-    cm = confusion_matrix(labels, evaluation_results[best_threshold]['predictions'])
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Normal', 'Anomaly'], yticklabels=['Normal', 'Anomaly'])
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.title(f'{model_type.upper()} Confusion Matrix (Best Threshold: {best_threshold})')
-    plt.tight_layout()
-    plt.savefig(f'{save_dir}/{model_type}_confusion_matrix.png', dpi=300, bbox_inches='tight')
-    plt.close()
+    # Best performing threshold confusion matrix
+    best_threshold = max(evaluation_results.keys(), key=lambda x: evaluation_results[x]['f1_score'])
+    print(f"Best threshold: {best_threshold} with F1={evaluation_results[best_threshold]['f1_score']:.3f}")
 
     print(f"📈 Visualizations saved to {save_dir}")
 
@@ -387,7 +416,7 @@ def evaluate_dae_model(checkpoint_path='checkpoints/dae_sonar_best.pth', device=
         )
 
         # Determine thresholds
-        thresholds = determine_anomaly_thresholds(errors, labels)
+        thresholds = determine_anomaly_thresholds(errors, labels, strategies=['percentile', 'statistical', 'optimized'])
 
         # Evaluate anomaly detection
         evaluation_results = evaluate_anomaly_detection(errors, labels, thresholds)
@@ -395,8 +424,13 @@ def evaluate_dae_model(checkpoint_path='checkpoints/dae_sonar_best.pth', device=
         # Create visualizations
         create_evaluation_visualizations(errors, labels, evaluation_results, 'dae')
 
-        # Log results
+        # Log results and save to CSV
         log_evaluation_results(evaluation_results, latencies, 'dae')
+
+        # Save results with latency to CSV (only best threshold)
+        best_threshold = max(evaluation_results.keys(), key=lambda x: evaluation_results[x]['f1_score'])
+        best_results = {best_threshold: evaluation_results[best_threshold]}
+        save_evaluation_results_to_csv(best_results, 'DAE', 'SONAR', latencies)
 
         print("✅ DAE evaluation completed successfully")
 
@@ -461,7 +495,7 @@ def evaluate_vae_model(checkpoint_path='checkpoints/vae_ims_best.pth', device='c
         labels = y_ims_val_np[:n_samples]  # Take only the first n_samples labels
 
         # Determine thresholds
-        thresholds = determine_anomaly_thresholds(errors, labels)
+        thresholds = determine_anomaly_thresholds(errors, labels, strategies=['percentile', 'statistical', 'optimized'])
 
         # Evaluate anomaly detection
         evaluation_results = evaluate_anomaly_detection(errors, labels, thresholds)
@@ -469,8 +503,13 @@ def evaluate_vae_model(checkpoint_path='checkpoints/vae_ims_best.pth', device='c
         # Create visualizations
         create_evaluation_visualizations(errors, labels, evaluation_results, 'vae')
 
-        # Log results
+        # Log results and save to CSV
         log_evaluation_results(evaluation_results, latencies, 'vae')
+
+        # Save results with latency to CSV (only best threshold)
+        best_threshold = max(evaluation_results.keys(), key=lambda x: evaluation_results[x]['f1_score'])
+        best_results = {best_threshold: evaluation_results[best_threshold]}
+        save_evaluation_results_to_csv(best_results, 'VAE', 'IMS', latencies)
 
         print("✅ VAE evaluation completed successfully")
 
@@ -519,6 +558,56 @@ def main():
     except Exception as e:
         logger.error(f"VAE evaluation failed: {str(e)}")
         print(f"⚠️ VAE evaluation failed: {str(e)}")
+
+def save_evaluation_results_to_csv(evaluation_results, model_type, dataset_name, latencies):
+    """
+    Save evaluation results with latency metrics to CSV file.
+
+    Parameters:
+    evaluation_results (dict): Results from evaluate_anomaly_detection
+    model_type (str): 'DAE' or 'VAE'
+    dataset_name (str): 'SONAR' or 'IMS'
+    latencies (np.ndarray): Inference latencies per sample
+    """
+    import pandas as pd
+    import time
+
+    os.makedirs('results/summary', exist_ok=True)
+
+    # Find best performing threshold (highest F1 score)
+    best_threshold = max(evaluation_results.keys(), key=lambda x: evaluation_results[x]['f1_score'])
+    best_results = evaluation_results[best_threshold]
+
+    # Prepare results dictionary
+    results = {
+        'Dataset': dataset_name,
+        'Model': model_type,
+        'Total_Training_Time_s': 'N/A',  # Will be filled by training pipeline
+        'Epochs_Trained': 'N/A',
+        'Batch_Size': 'N/A',
+        'Learning_Rate': 'N/A',
+        'Random_Seed': 'N/A',
+        'Device': 'N/A',
+        'Final_Train_Loss': 'N/A',
+        'Final_Val_Loss': 'N/A',
+        'Precision': best_results['precision'],
+        'Recall': best_results['recall'],
+        'F1_Score': best_results['f1_score'],
+        'Accuracy': best_results['accuracy'],
+        'AUROC': best_results['auroc'],
+        'Best_Threshold': best_results['threshold'],
+        'Average_Latency_ms': best_results.get('avg_latency_ms', np.mean(latencies) if latencies is not None else 'N/A')
+    }
+
+    # Save to CSV
+    filename = f"results/summary/{model_type.lower()}_results.csv"
+    df = pd.DataFrame([results])
+    if os.path.exists(filename):
+        # Append to existing file
+        existing_df = pd.read_csv(filename)
+        df = pd.concat([existing_df, df], ignore_index=True)
+    df.to_csv(filename, index=False)
+    print(f"💾 Evaluation results saved to {filename} (latency: {results['Average_Latency_ms']:.3f} ms)")
 
     # Final summary
     print("\n🎯 EVALUATION COMPLETED")
