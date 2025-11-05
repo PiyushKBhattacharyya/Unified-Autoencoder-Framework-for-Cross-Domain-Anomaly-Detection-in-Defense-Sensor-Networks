@@ -4,3 +4,4 @@ venv
 **/*visualizations
 *.pth
 **/__pycache__/
+Research_Paper/
