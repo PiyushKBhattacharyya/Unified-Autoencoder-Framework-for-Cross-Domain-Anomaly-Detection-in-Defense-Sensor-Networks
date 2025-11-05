@@ -544,7 +544,7 @@ def create_dae_sonar(input_dim=60):
     print(f"Created DAE for Sonar: Input dim {input_dim}, Latent dim 8")
     return model
 
-def create_vae_ims(window_size=1024, n_channels=8, latent_dim=64):
+def create_vae_ims(window_size=1024, n_channels=8, latent_dim=128):
     """
     Factory function for IMS VAE model instantiation.
 

@@ -127,13 +127,13 @@ class DefenseAnomalyDetector:
         # Define hyperparameter grids - optimized for near-perfect anomaly detection
         if model_type == 'DAE':
             param_grid = {
-                'learning_rate': [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 2e-4],  # Very low learning rates for stable training
+                'learning_rate': [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 2e-4, 1e-3],  # Include 0.001 (1e-3) for comprehensive search
                 'batch_size': [4, 8, 12, 16],  # Smaller batches for better generalization
                 'epochs': [300, 400, 500]  # More epochs for convergence without overfitting
             }
         else:  # VAE
             param_grid = {
-                'learning_rate': [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 2e-4],
+                'learning_rate': [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 2e-4, 1e-3],  # Include 0.001 (1e-3) for comprehensive search
                 'batch_size': [4, 8, 12, 16],
                 'epochs': [300, 400, 500]
             }

@@ -5,3 +5,5 @@ venv
 *.pth
 **/__pycache__/
 Research_Paper/
+results
+**/*.ipynb_checkpoints
